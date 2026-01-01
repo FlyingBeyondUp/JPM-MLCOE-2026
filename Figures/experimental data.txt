@@ -1,0 +1,139 @@
+--- Eigenvalues of Transition Matrix A (Invariant to Rotation) ---
+True Eigenvalues:      [0.9236171+0.j         0.8915483+0.06713497j 0.8915483-0.06713497j]
+Estimated Eigenvalues: [0.9486966+0.j 0.8047749+0.j 0.5320153+0.j]
+True Moduli:           [0.9236171 0.8940724 0.8940724]
+Estimated Moduli:      [0.9486966 0.8047749 0.5320153]
+
+
+Running comparison for T=100 steps with 100 particles...
+Running Standard Particle Filter...
+Standard PF took 0.4457 seconds.
+Running EDH Particle Flow...
+EDH Flow took 1.0532 seconds.
+
+=== Batch Comparison (Batch Size: 100) ===
+Standard PF | MSE: 0.03294 | Avg Terminal Var: 0.00275
+EDH Flow    | MSE: 0.01006 | Avg Terminal Var: 0.01001
+===================================================
+
+
+Process finished with exit code 0
+
+
+
+Experiment B in PF-PF:
+
+sigmaz=0.5:
+Running Optimal Kalman Filter (Baseline)...
+Optimal KF took 0.0011 seconds.
+Running Standard Particle Filter...
+Standard PF took 0.5012 seconds.
+UKF took 0.0030 seconds.
+Running EDH Particle Flow...
+EDH Flow took 0.0385 seconds.
+Running PF-PF (EDH) Particle Flow...
+PF-PF took 0.0489 seconds.
+Running PF-PF (EDH) Particle Flow with 10^4 particles...
+PF-PF (10^4) took 0.8773 seconds.
+Running PF-PF (LEDH) Particle Flow...
+PF-PF took 1.3381 seconds.
+
+=== Linear Spatial Model Comparison ===
+PF-PF  (EDH)     | MSE: 0.10597
+PF-PF  (EDH 10^4)     | MSE: 0.09237
+PF-PF (LEDH)      | MSE: 0.10488
+EDH Flow    | MSE: 0.07167
+Optimal KF  | MSE: 0.07143
+Standard UKF | MSE: 0.07143
+Standard PF | MSE: 1.36138
+Standard PF (10^5) | MSE: 0.36320
+========================================
+
+Mean ESS Standard PF: 1.04
+Mean ESS Standard PF (10^5): 1.34
+Mean ESS PF-PF (LEDH): 17.40
+Mean ESS PF-PF (EDH): 17.25
+Mean ESS PF-PF (EDH 10^4): 698.08
+
+Process finished with exit code 0
+
+sigmaz=1.0 and 2.0:
+Running Optimal Kalman Filter (Baseline)...
+Optimal KF took 0.0011 seconds.
+Running Standard Particle Filter...
+Standard PF took 0.0030 seconds.
+Standard PF (Multinomial) took 0.0054 seconds.
+Running Standard Particle Filter with 10^5 particles (in splits)...
+Standard PF took 0.4602 seconds.
+UKF took 0.0023 seconds.
+EDH raw Flow took 0.0467 seconds.
+Running EDH Particle Flow...
+EDH Flow took 0.0346 seconds.
+Running PF-PF (EDH) Particle Flow...
+PF-PF took 0.0414 seconds.
+Running PF-PF (EDH) Particle Flow with 10^4 particles...
+PF-PF (10^4) took 0.5367 seconds.
+Running PF-PF (LEDH) Particle Flow...
+PF-PF took 1.2912 seconds.
+
+=== Linear Spatial Model Comparison ===
+PF-PF (LEDH)      | MSE: 0.25076
+PF-PF  (EDH)     | MSE: 0.25389
+PF-PF  (EDH 10^4)     | MSE: 0.21615
+EDH Flow    | MSE: 0.18471
+EDH raw    | MSE: 0.19305
+Optimal KF  | MSE: 0.18428
+Standard UKF | MSE: 0.18428
+Standard PF (Multinomial) | MSE: 1.38731
+Standard PF | MSE: 1.38944
+Standard PF (10^5) | MSE: 0.39294
+========================================
+
+Mean ESS Standard PF (Multinomial): 1.18
+Mean ESS Standard PF: 1.18
+Mean ESS Standard PF (10^5): 3.05
+Mean ESS PF-PF (LEDH): 23.25
+Mean ESS PF-PF (EDH): 23.08
+Mean ESS PF-PF (EDH 10^4): 904.76
+Warming up JIT compilation...
+Warm up complete.
+
+Running Optimal Kalman Filter (Baseline)...
+Optimal KF took 0.0012 seconds.
+Running Standard Particle Filter...
+Standard PF took 0.0039 seconds.
+Standard PF (Multinomial) took 0.0033 seconds.
+Running Standard Particle Filter with 10^5 particles (in splits)...
+Standard PF took 0.4651 seconds.
+UKF took 0.0029 seconds.
+EDH raw Flow took 0.0468 seconds.
+Running EDH Particle Flow...
+EDH Flow took 0.0412 seconds.
+Running PF-PF (EDH) Particle Flow...
+PF-PF took 0.0491 seconds.
+Running PF-PF (EDH) Particle Flow with 10^4 particles...
+PF-PF (10^4) took 0.6151 seconds.
+Running PF-PF (LEDH) Particle Flow...
+PF-PF took 1.5060 seconds.
+
+=== Linear Spatial Model Comparison ===
+PF-PF (LEDH)      | MSE: 0.61125
+PF-PF  (EDH)     | MSE: 0.60236
+PF-PF  (EDH 10^4)     | MSE: 0.52237
+EDH Flow    | MSE: 0.49166
+EDH raw    | MSE: 0.50240
+Optimal KF  | MSE: 0.49236
+Standard UKF | MSE: 0.49236
+Standard PF (Multinomial) | MSE: 1.48115
+Standard PF | MSE: 1.46493
+Standard PF (10^5) | MSE: 0.56715
+========================================
+
+Mean ESS Standard PF (Multinomial): 1.96
+Mean ESS Standard PF: 1.89
+Mean ESS Standard PF (10^5): 38.72
+Mean ESS PF-PF (LEDH): 27.98
+Mean ESS PF-PF (EDH): 28.42
+Mean ESS PF-PF (EDH 10^4): 1035.44
+
+Process finished with exit code 0
