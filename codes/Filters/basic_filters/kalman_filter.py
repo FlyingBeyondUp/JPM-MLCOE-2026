@@ -2,16 +2,16 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 import math
 from Filters.basic_filters.base_filter import BaseFilter
-from models import LGSSM
+from models.base_models import LGSSM
 
 tfd = tfp.distributions
-dtype=tf.float32
+dtype = tf.float32
 
 class KalmanFilter(BaseFilter):
     """
     Standard Kalman Filter for Linear Gaussian State-Space Models (LGSSM).
 
-    Inherits from BaseFilter to utilize the generic time-series tracking loop. 
+    Inherits from BaseFilter to utilize the generic time-series tracking loop.
     The tracking state is defined as a 4-tuple to retain both prior and posterior:
     (x_filtered, P_filtered, x_predicted, P_predicted).
     """
@@ -81,7 +81,7 @@ class KalmanFilter(BaseFilter):
         # Innovation
         innov = y_t - tf.matmul(C, x_pred)
         PCt = tf.matmul(P_pred, C, transpose_b=True)
-        S_t = tf.matmul(C, PCt) + R + 1e-6 * tf.eye(obs_dim,dtype=dtype)
+        S_t = tf.matmul(C, PCt) + R + 1e-6 * tf.eye(obs_dim, dtype=dtype)
 
         S_chol = tf.linalg.cholesky(S_t)
 
@@ -122,13 +122,11 @@ class KalmanFilter(BaseFilter):
         x_filt, P_filt, x_pred, P_pred = state
         log_l = metrics[0]
 
-        x_filt_ta = x_filt_ta.write(t, x_filt)
-        P_filt_ta = P_filt_ta.write(t, P_filt)
-        x_pred_ta = x_pred_ta.write(t, x_pred)
-        P_pred_ta = P_pred_ta.write(t, P_pred)
-        logl_ta = logl_ta.write(t, log_l)
-
-        return (x_filt_ta, P_filt_ta, x_pred_ta, P_pred_ta, logl_ta)
+        return (
+            x_filt_ta.write(t, x_filt), P_filt_ta.write(t, P_filt),
+            x_pred_ta.write(t, x_pred), P_pred_ta.write(t, P_pred),
+            logl_ta.write(t, log_l)
+        )
 
     def _format_output(self, trajectory: tuple) -> dict:
         """Stacks the TensorArrays and returns a clean dictionary."""
@@ -158,13 +156,8 @@ class KalmanFilter(BaseFilter):
 
     def forecast(self, observations: tf.Tensor) -> tuple:
         """
-        Generates the forecast of the next observation based on the provided trajectory of observations.
-
-        Returns:
-            y_pred_next: The predicted observation at T+1 [Batch, Obs_Dim]
-            S_next: The innovation covariance at T+1 [Batch, Obs_Dim, Obs_Dim]
+        Generates the forecast of the next observation based on the provided trajectory.
         """
-        # Run filter to get state at time T
         res = self.filter(observations)
         x_filt_last = tf.expand_dims(res['x_filt'][:, -1, :], -1)  # [B, Dx, 1]
         P_filt_last = res['P_filt'][:, -1, :, :]
@@ -184,11 +177,13 @@ class KalmanFilter(BaseFilter):
 
         return y_pred_next, S_next
 
-    def smooth_filter(self, y):
+    @tf.function
+    def smooth(self, Y: tf.Tensor):
         """
         Batched RTS Smoother.
+        Renamed from 'smooth_filter' to 'smooth' to match EKF naming conventions.
         """
-        res = self.filter(y)
+        res = self.filter(Y)
         x_filt_in, P_filt_in = res['x_filt'], res['P_filt']
         x_pred_in, P_pred_in = res['x_pred'], res['P_pred']
         log_l = res['log_likelihood']
@@ -200,7 +195,7 @@ class KalmanFilter(BaseFilter):
 
         x_smooth_ta = tf.TensorArray(dtype, size=T, clear_after_read=False)
         P_smooth_ta = tf.TensorArray(dtype, size=T, clear_after_read=False)
-        J_ta = tf.TensorArray(dtype, size=max(1, T - 1))
+        J_ta = tf.TensorArray(dtype, size=tf.maximum(1, T - 1))
 
         # Initialize at T-1
         x_last = tf.expand_dims(x_filt_in[:, T - 1, :], -1)
@@ -244,67 +239,65 @@ class KalmanFilter(BaseFilter):
 
         return x_smooth, P_smooth, J_ts, log_l
 
+    def fit(self, Y: tf.Tensor, n_iter: int = 10, tol: float = 1e-3, **kwargs):
+        """
+        Unified API for Expectation-Maximization (EM) solver.
+        Estimates the parameters (A, C, Q, R, x0, P0) of the LGSSM from data.
+        """
+        T = int(tf.shape(Y)[1])
+        list_log_l = []
 
-def EM_solver(kf: KalmanFilter, Y, max_iters=10, tol=1e-3):
-    """
-    Expectation-Maximization solver to estimate LGSSM parameters from data.
-    """
-    T = int(tf.shape(Y)[1])
-    list_log_l = []
+        for i in range(n_iter):
+            # E-step: run Kalman smoother to get expected sufficient statistics
+            X_s, P_s, J_s, log_L = self.smooth(Y)
 
-    for i in range(max_iters):
-        # E-step: run Kalman smoother to get expected sufficient statistics
-        X_s, P_s, J_s, log_L = kf.smooth_filter(Y)
+            # Aggregate batch log-likelihoods
+            total_log_L = tf.reduce_mean(log_L)
+            scalar_log_L = float(total_log_L.numpy().item() if total_log_L.ndim == 0 else total_log_L.numpy().mean())
+            print(f'EM Iteration {i}, Log Likelihood: {scalar_log_L:.4f}')
+            list_log_l.append(scalar_log_L)
+            if len(list_log_l) > 1 and abs(list_log_l[-1] - list_log_l[-2]) < tol:
+                self.model.update_cholesky()
+                print(f'EM converged at iteration {i}')
+                break
 
-        # Aggregate batch log-likelihoods
-        total_log_L = tf.reduce_mean(log_L)
-        print(f'EM Iteration {i}, Log Likelihood: {total_log_L.numpy():.4f}')
+            Exx = P_s + tf.matmul(tf.expand_dims(X_s, -1), tf.expand_dims(X_s, -2))
+            Exx1 = tf.matmul(P_s[:, 1:, :, :], J_s, transpose_b=True) + \
+                   tf.matmul(tf.expand_dims(X_s[:, 1:, :], -1), tf.expand_dims(X_s[:, :-1, :], -2))
 
-        list_log_l.append(total_log_L)
-        if len(list_log_l) > 1 and abs(list_log_l[-1] - list_log_l[-2]) < tol:
-            kf.model.update_cholesky()
-            print(f'EM converged at iteration {i}')
-            break
+            Sigma_xx = tf.reduce_sum(Exx[:, :-1, :, :], axis=[0, 1])
+            Gamma_xx = Sigma_xx + tf.reduce_sum(Exx[:, -1, :, :], axis=0)
+            Sigma_x1x1 = Gamma_xx - tf.reduce_sum(Exx[:, 0, :, :], axis=0)
+            Sigma_xx1 = tf.reduce_sum(Exx1, axis=[0, 1])
+            Gamma_yy = tf.reduce_sum(tf.matmul(tf.expand_dims(Y, -1), tf.expand_dims(Y, -2)), axis=[0, 1])
+            Gamma_yx = tf.reduce_sum(tf.matmul(tf.expand_dims(Y, -1), tf.expand_dims(X_s, -2)), axis=[0, 1])
 
-        Exx = P_s + tf.matmul(tf.expand_dims(X_s, -1), tf.expand_dims(X_s, -2))
-        Exx1 = tf.matmul(P_s[:, 1:, :, :], J_s, transpose_b=True) + \
-               tf.matmul(tf.expand_dims(X_s[:, 1:, :], -1), tf.expand_dims(X_s[:, :-1, :], -2))
+            # M-step: update model parameters using the expected sufficient statistics
+            Sigma_xx_chol = tf.linalg.cholesky(Sigma_xx + 1e-6 * tf.eye(self.model.state_dim, dtype=Sigma_xx.dtype))
+            Sigma_x1x1_chol = tf.linalg.cholesky(Sigma_x1x1 + 1e-6 * tf.eye(self.model.state_dim, dtype=Sigma_x1x1.dtype))
 
-        Sigma_xx = tf.reduce_sum(Exx[:, :-1, :, :], axis=[0, 1])
-        Gamma_xx = Sigma_xx + tf.reduce_sum(Exx[:, -1, :, :], axis=0)
-        Sigma_x1x1 = Gamma_xx - tf.reduce_sum(Exx[:, 0, :, :], axis=0)
-        Sigma_xx1 = tf.reduce_sum(Exx1, axis=[0, 1])
-        Gamma_yy = tf.reduce_sum(tf.matmul(tf.expand_dims(Y, -1), tf.expand_dims(Y, -2)), axis=[0, 1])
-        Gamma_yx = tf.reduce_sum(tf.matmul(tf.expand_dims(Y, -1), tf.expand_dims(X_s, -2)), axis=[0, 1])
+            A_new = tf.transpose(tf.linalg.cholesky_solve(Sigma_x1x1_chol, tf.transpose(Sigma_xx1)))
+            C_new = tf.transpose(tf.linalg.cholesky_solve(Sigma_xx_chol, tf.transpose(Gamma_yx)))
 
-        # M-step: update model parameters using the expected sufficient statistics
-        Sigma_xx_chol = tf.linalg.cholesky(Sigma_xx + 1e-6 * tf.eye(kf.model.state_dim, dtype=Sigma_xx.dtype))
-        Sigma_x1x1_chol = tf.linalg.cholesky(Sigma_x1x1 + 1e-6 * tf.eye(kf.model.state_dim, dtype=Sigma_x1x1.dtype))
+            R_term = Gamma_yy - C_new @ tf.transpose(Gamma_yx) - Gamma_yx @ tf.transpose(C_new) + C_new @ Gamma_xx @ tf.transpose(C_new)
+            R_new = R_term / (tf.cast(tf.shape(Y)[0] * T, dtype))
+            R_new = 0.5 * (R_new + tf.transpose(R_new)) + 1e-6 * tf.eye(self.model.obs_dim)
 
-        A_new = tf.transpose(tf.linalg.cholesky_solve(Sigma_x1x1_chol, tf.transpose(Sigma_xx1)))
-        C_new = tf.transpose(tf.linalg.cholesky_solve(Sigma_xx_chol, tf.transpose(Gamma_yx)))
+            Q_term = Sigma_x1x1 - A_new @ tf.transpose(Sigma_xx1) - Sigma_xx1 @ tf.transpose(A_new) + A_new @ Sigma_xx @ tf.transpose(A_new)
+            Q_new = Q_term / (tf.cast(tf.shape(Y)[0] * (T - 1), dtype))
+            Q_new = 0.5 * (Q_new + tf.transpose(Q_new)) + 1e-6 * tf.eye(self.model.state_dim)
 
-        R_term = Gamma_yy - C_new @ tf.transpose(Gamma_yx) - Gamma_yx @ tf.transpose(
-            C_new) + C_new @ Gamma_xx @ tf.transpose(C_new)
-        R_new = R_term / (tf.cast(tf.shape(Y)[0] * T, dtype))
-        R_new = 0.5 * (R_new + tf.transpose(R_new)) + 1e-6 * tf.eye(kf.model.obs_dim)
+            x0_new = tf.reduce_mean(X_s[:, 0, :], axis=0, keepdims=True)
+            centered_x0 = X_s[:, 0, :] - x0_new
+            cov_means = tf.matmul(tf.expand_dims(centered_x0, -1), tf.expand_dims(centered_x0, -2))
 
-        Q_term = Sigma_x1x1 - A_new @ tf.transpose(Sigma_xx1) - Sigma_xx1 @ tf.transpose(
-            A_new) + A_new @ Sigma_xx @ tf.transpose(A_new)
-        Q_new = Q_term / (tf.cast(tf.shape(Y)[0] * (T - 1), dtype))
-        Q_new = 0.5 * (Q_new + tf.transpose(Q_new)) + 1e-6 * tf.eye(kf.model.state_dim)
+            P0_new = tf.reduce_mean(P_s[:, 0, :, :] + cov_means, axis=0)
+            P0_new = 0.5 * (P0_new + tf.transpose(P0_new)) + 1e-6 * tf.eye(self.model.state_dim)
 
-        x0_new = tf.reduce_mean(X_s[:, 0, :], axis=0, keepdims=True)
-        centered_x0 = X_s[:, 0, :] - x0_new
-        cov_means = tf.matmul(tf.expand_dims(centered_x0, -1), tf.expand_dims(centered_x0, -2))
+            self.model.set_params([A_new, C_new, Q_new, R_new, tf.transpose(x0_new), P0_new])
 
-        P0_new = tf.reduce_mean(P_s[:, 0, :, :] + cov_means, axis=0)
-        P0_new = 0.5 * (P0_new + tf.transpose(P0_new)) + 1e-6 * tf.eye(kf.model.state_dim)
-
-        kf.model.set_params([A_new, C_new, Q_new, R_new, tf.transpose(x0_new), P0_new])
-
-    kf.model.update_cholesky()
-    return list_log_l
+        self.model.update_cholesky()
+        return list_log_l
 
 
 def EM_initializer(Y, state_dim):
