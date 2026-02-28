@@ -4,8 +4,8 @@ import tensorflow_probability as tfp
 import numpy as np
 
 # Assuming these are the module names in your project structure
-from codes.models import LearnableSSM
-from codes.Filters.differentiable_filters import SoftResamplingParticleFilter
+from models import LearnableSSM
+from Filters.differentiable_filters import SoftResamplingParticleFilter
 
 tfd = tfp.distributions
 

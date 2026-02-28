@@ -1,222 +1,213 @@
 import tensorflow as tf
-tf.keras.backend.set_floatx('float64')
 import tensorflow_probability as tfp
-from typing import Callable,Union
-import matplotlib.pyplot as plt
 import math
-from models import NLSSM, LGSSM
-import time
+from Filters.basic_filters.base_filter import BaseFilter
+from models.base_models import NLSSM
 
-tfd=tfp.distributions
-dtype=tf.float32
+tfd = tfp.distributions
+dtype = tf.float32
 
 
-class ExtendedKalmanFilter:
-    def __init__(self, model:NLSSM):
-        # model: state_dim, obs_dim, transition_fn, observation_fn
-        #        process_noise, observation_noise, init_noise, x0
-        self.model = model
+class ExtendedKalmanFilter(BaseFilter):
+    """
+    Extended Kalman Filter (EKF) for Non-Linear State-Space Models.
 
-    def _get_cov(self, dist):
-        """Extracts covariance, ensuring 2D shape."""
-        try:
-            cov = dist.covariance()
-        except (AttributeError, NotImplementedError):
-            var = dist.variance()
-            if len(var.shape) == 0:
-                var = tf.reshape(var, [1])
-            cov = tf.linalg.diag(var)
+    Assumes strictly additive process and observation noise:
+    x_t = f(x_{t-1}) + q_t
+    y_t = h(x_t) + r_t
+    """
 
-        if len(cov.shape) == 0:
-            cov = tf.reshape(cov, [1, 1])
-        elif len(cov.shape) == 1:
-            cov = tf.linalg.diag(cov)
+    def __init__(self, model: NLSSM, requires_stabilization: bool = True):
+        super().__init__(model)
+        self.requires_stabilization = requires_stabilization
 
-        return tf.cast(cov, dtype=dtype)
-
-    @tf.function
-    def _linearize(self, fn, x, noise):
-        """Single sample linearization."""
-        with tf.GradientTape(persistent=True) as tape:
-            tape.watch(x)
-            tape.watch(noise)
-            val = fn(x, noise)
-
-        J_x = tape.jacobian(val, x, experimental_use_pfor=False)
-        J_noise = tape.jacobian(val, noise, experimental_use_pfor=False)
-        del tape
-        return val, J_x, J_noise
-
-    @tf.function
-    def _batch_linearize(self, fn, x, noise):
+    def _batch_linearize(self, fn, x):
         """
-        Batch linearization using batch_jacobian for efficiency.
-        x: [Batch, Dim]
+        Batch linearization.
+        Only computes the Jacobian with respect to the state (A or C).
         """
-        with tf.GradientTape(persistent=True) as tape:
+        # Pass zero noise to isolate the deterministic function
+        zero_noise = tf.zeros_like(x) if fn.__name__ == 'transition_fn' else tf.zeros(
+            [tf.shape(x)[0], self.model.obs_dim])
+
+        with tf.GradientTape() as tape:
             tape.watch(x)
-            tape.watch(noise)
-            val = fn(x, noise)
+            val = fn(x, zero_noise)
 
-        # batch_jacobian returns [Batch, Dim_out, Dim_in]
-        J_x = tape.batch_jacobian(val, x, experimental_use_pfor=True)
-        J_noise = tape.batch_jacobian(val, noise, experimental_use_pfor=True)
-        del tape
-        return val, J_x, J_noise
+        J_x = tape.batch_jacobian(val, x)
+        return val, J_x
 
-    @tf.function
-    def filter(self, y: tf.Tensor, T: int, requires_stabilization=True, return_jacobians=False):
+    def _init_state(self, batch_size: int) -> tuple:
         state_dim = self.model.state_dim
-        obs_dim = self.model.obs_dim
-        Q = self._get_cov(self.model.process_noise)
-        R = self._get_cov(self.model.observation_noise)
+
+        x0_reshaped = tf.reshape(self.model.x0, [state_dim])
         P0 = self._get_cov(self.model.init_noise)
 
-        # Initialization
-        x_curr = tf.reshape(self.model.x0, [state_dim, 1])
-        P_curr = P0
+        x_init = tf.tile(tf.expand_dims(x0_reshaped, 0), [batch_size, 1])
+        P_init = tf.tile(tf.expand_dims(P0, 0), [batch_size, 1, 1])
+        A_init = tf.tile(tf.expand_dims(tf.eye(state_dim, dtype=dtype), 0), [batch_size, 1, 1])
 
-        # Pre-allocate zero noise for linearization
-        zero_proc = tf.zeros([state_dim], dtype=dtype)
-        zero_obs = tf.zeros([obs_dim], dtype=dtype)
+        return (x_init, P_init, x_init, P_init, A_init)
 
-        # Storage
-        x_pred_arr = tf.TensorArray(dtype=dtype, size=T)
-        P_pred_arr = tf.TensorArray(dtype=dtype, size=T)
-        x_filt_arr = tf.TensorArray(dtype=dtype, size=T)
-        P_filt_arr = tf.TensorArray(dtype=dtype, size=T)
+    def _init_trajectory(self, time_steps: int) -> tuple:
+        x_filt_ta = tf.TensorArray(dtype, size=time_steps)
+        P_filt_ta = tf.TensorArray(dtype, size=time_steps)
+        x_pred_ta = tf.TensorArray(dtype, size=time_steps)
+        P_pred_ta = tf.TensorArray(dtype, size=time_steps)
+        A_ta = tf.TensorArray(dtype, size=time_steps)
+        logl_ta = tf.TensorArray(dtype, size=time_steps)
 
-        # A_arr stores Jacobian F_t for transition t -> t+1
-        # Size T-1 is sufficient for smoothing, but T is safer for indexing
-        A_arr = tf.TensorArray(dtype=dtype, size=T)
+        return (x_filt_ta, P_filt_ta, x_pred_ta, P_pred_ta, A_ta, logl_ta)
 
-        log_l = tf.constant(0.0, dtype=dtype)
-        const_term = tf.cast(-0.5 * float(obs_dim), dtype) * tf.math.log(tf.constant(2 * math.pi, dtype=dtype))
-        for t in range(T):
-            # --- Prediction Step ---
-            if t == 0:
-                x_pred = x_curr
-                P_pred = P_curr
-            else:
-                # 1. Retrieve Jacobian A_{t-1} computed in previous step
-                # In this loop structure, we actually compute prediction using the *previous* state
-                # So we must compute linearization at x_{t-1|t-1}
-                # Note: x_curr holds x_{t-1|t-1} here
-                f_val, A, W = self._linearize(self.model.transition_fn, x_curr, zero_proc)
-                A = tf.reshape(A, [state_dim, state_dim])
-                W = tf.reshape(W, [state_dim, state_dim])
-                # Store Jacobian A_{t-1} which drives (t-1) -> t
-                A_arr = A_arr.write(t - 1, A)
+    def predict(self, t: int, state: tuple) -> tuple:
+        x_filt_prev, P_filt_prev, _, _, _ = state
 
-                x_pred = f_val
-                P_pred = A @ P_curr @ tf.transpose(A) + W @ Q @ tf.transpose(W)
-                # Symmetrize Prediction
-                P_pred = 0.5 * (P_pred + tf.transpose(P_pred))
+        Q = tf.expand_dims(self._get_cov(self.model.process_noise), 0)
 
-            # --- Update Step ---
-            h_val, C, V = self._linearize(self.model.observation_fn, x_pred, zero_obs)
-            C = tf.reshape(C, [obs_dim, state_dim])
-            V = tf.reshape(V, [obs_dim, obs_dim])
+        # 1. Linearize just the state
+        x_pred, A = self._batch_linearize(self.model.transition_fn, x_filt_prev)
 
-            innov = tf.reshape(y[t] - h_val, [obs_dim, 1])
-            R_eff = V @ R @ tf.transpose(V)
-            S_t = C @ P_pred @ tf.transpose(C) + R_eff + 1e-6 * tf.eye(obs_dim,dtype=dtype)
-            S_t = 0.5 * (S_t + tf.transpose(S_t))
-            # Stable Inversion
-            S_chol = tf.linalg.cholesky(S_t)
-            # K = P C^T S^{-1}
-            # We solve S K^T = C P  => K^T = S^{-1} C P
-            Kt_transposed = tf.linalg.cholesky_solve(S_chol, C @ P_pred)
-            K_t = tf.transpose(Kt_transposed)
+        # 2. Additive noise update (No W matrix needed!)
+        P_pred = tf.matmul(A, tf.matmul(P_filt_prev, A, transpose_b=True)) + Q
+        P_pred = 0.5 * (P_pred + tf.linalg.matrix_transpose(P_pred))
 
-            x_curr = x_pred + K_t @ innov
-            I_KC = tf.eye(state_dim,dtype=dtype) - K_t @ C
-            if requires_stabilization:
-                # Joseph Form: (I-KC)P(I-KC)' + KRK'
-                P_curr = I_KC @ P_pred @ tf.transpose(I_KC) + K_t @ R_eff @ tf.transpose(K_t)
-            else:
-                P_curr = I_KC @ P_pred
+        return (x_pred, P_pred, x_pred, P_pred, A)
 
-            # Enforce Symmetry
-            P_curr = 0.5 * (P_curr + tf.transpose(P_curr))
-            # Log Likelihood Calculation
-            log_det_S = 2 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(S_chol)))
-            quad_term = tf.squeeze(tf.transpose(innov) @ tf.linalg.cholesky_solve(S_chol, innov))
-            log_l += const_term - 0.5 * log_det_S - 0.5 * quad_term
+    def update(self, t: int, state: tuple, observation: tf.Tensor) -> tuple:
+        _, _, x_pred, P_pred, A_t = state
 
-            x_pred_arr = x_pred_arr.write(t, x_pred)
-            P_pred_arr = P_pred_arr.write(t, P_pred)
-            x_filt_arr = x_filt_arr.write(t, x_curr)
-            P_filt_arr = P_filt_arr.write(t, P_curr)
+        obs_dim = self.model.obs_dim
+        state_dim = self.model.state_dim
 
-        # For the very last step, we don't strictly need A_T, but let's pad it
-        # Or, simpler: The smoother loop only goes up to T-2 accessing A_{T-2}
+        R = tf.expand_dims(self._get_cov(self.model.observation_noise), 0)
 
-        results = (x_filt_arr.stack(), P_filt_arr.stack(), x_pred_arr.stack(), P_pred_arr.stack(), log_l)
-        if return_jacobians:
-            return results + (A_arr.stack(),)
-        return results
+        # 1. Linearize just the state
+        h_val, C = self._batch_linearize(self.model.observation_fn, x_pred)
+
+        innov = tf.expand_dims(observation - h_val, -1)
+
+        # 2. Additive noise update (No V matrix needed, R_eff is just R)
+        S_t = tf.matmul(C, tf.matmul(P_pred, C, transpose_b=True)) + R + 1e-6 * tf.eye(obs_dim, dtype=dtype)
+        S_t = 0.5 * (S_t + tf.linalg.matrix_transpose(S_t))
+        S_chol = tf.linalg.cholesky(S_t)
+
+        Kt_transposed = tf.linalg.cholesky_solve(S_chol, tf.matmul(C, P_pred))
+        K_t = tf.linalg.matrix_transpose(Kt_transposed)
+
+        x_filt = x_pred + tf.squeeze(tf.matmul(K_t, innov), -1)
+
+        I_KC = tf.eye(state_dim, dtype=dtype) - tf.matmul(K_t, C)
+        if self.requires_stabilization:
+            term1 = tf.matmul(I_KC, tf.matmul(P_pred, I_KC, transpose_b=True))
+            term2 = tf.matmul(K_t, tf.matmul(R, K_t, transpose_b=True))
+            P_filt = term1 + term2
+        else:
+            P_filt = tf.matmul(I_KC, P_pred)
+
+        P_filt = 0.5 * (P_filt + tf.linalg.matrix_transpose(P_filt))
+
+        const_term = -0.5 * float(obs_dim) * tf.math.log(2 * math.pi)
+        diag_S = tf.maximum(tf.linalg.diag_part(S_chol), 1e-6)
+        log_det_S = 2 * tf.reduce_sum(tf.math.log(diag_S), axis=-1)
+
+        quad_term = tf.squeeze(tf.matmul(tf.linalg.matrix_transpose(innov), tf.linalg.cholesky_solve(S_chol, innov)),
+                               [1, 2])
+        log_l = const_term - 0.5 * log_det_S - 0.5 * quad_term
+
+        new_state = (x_filt, P_filt, x_pred, P_pred, A_t)
+        return new_state, (log_l,)
+
+    def forecast(self, observations: tf.Tensor) -> tuple:
+        res = self.filter(observations)
+        x_filt_last = res['x_filt'][:, -1, :]
+        P_filt_last = res['P_filt'][:, -1, :, :]
+
+        state_last = (x_filt_last, P_filt_last, None, None, None)
+        x_pred_next, P_pred_next, _, _, _ = self.predict(0, state_last)
+
+        y_pred_next, C = self._batch_linearize(self.model.observation_fn, x_pred_next)
+
+        R = tf.expand_dims(self._get_cov(self.model.observation_noise), 0)
+        S_next = tf.matmul(C, tf.matmul(P_pred_next, C, transpose_b=True)) + R
+
+        return y_pred_next, S_next
+
+    def _write_trajectory(self, t: int, trajectory: tuple, state: tuple, metrics: tuple) -> tuple:
+        x_filt_ta, P_filt_ta, x_pred_ta, P_pred_ta, A_ta, logl_ta = trajectory
+        x_filt, P_filt, x_pred, P_pred, A_t = state
+        log_l = metrics[0]
+
+        return (
+            x_filt_ta.write(t, x_filt), P_filt_ta.write(t, P_filt),
+            x_pred_ta.write(t, x_pred), P_pred_ta.write(t, P_pred),
+            A_ta.write(t, A_t), logl_ta.write(t, log_l)
+        )
+
+    def _format_output(self, trajectory: tuple) -> dict:
+        x_filt_ta, P_filt_ta, x_pred_ta, P_pred_ta, A_ta, logl_ta = trajectory
+        return {
+            "x_filt": tf.transpose(x_filt_ta.stack(), perm=[1, 0, 2]),
+            "P_filt": tf.transpose(P_filt_ta.stack(), perm=[1, 0, 2, 3]),
+            "x_pred": tf.transpose(x_pred_ta.stack(), perm=[1, 0, 2]),
+            "P_pred": tf.transpose(P_pred_ta.stack(), perm=[1, 0, 2, 3]),
+            "A_t": tf.transpose(A_ta.stack(), perm=[1, 0, 2, 3]),
+            "log_likelihood": tf.reduce_sum(tf.transpose(logl_ta.stack(), perm=[1, 0]), axis=-1)
+        }
 
     @tf.function
-    def smooth(self, y: tf.Tensor, T: int):
-        """
-        RTS Smoother.
-        Fixed Indexing: A_arr[t] now corresponds to transition t -> t+1.
-        """
-        x_filt, P_filt, x_pred, P_pred, log_l, A_arr = self.filter(y, T, return_jacobians=True)
+    def smooth(self, Y: tf.Tensor):
+        """Batched RTS Smoother (Remains unchanged, as smoothing only requires A)."""
+        res = self.filter(Y)
+        x_filt, P_filt = res['x_filt'], res['P_filt']
+        x_pred, P_pred = res['x_pred'], res['P_pred']
+        A_arr = res['A_t']
+        log_l = res['log_likelihood']
 
-        x_smooth = tf.TensorArray(dtype=dtype, size=T, clear_after_read=False)
-        P_smooth = tf.TensorArray(dtype=dtype, size=T, clear_after_read=False)
-        P_cross = tf.TensorArray(dtype=dtype, size=T - 1)
+        batch_size = tf.shape(x_filt)[0]
+        T = tf.shape(x_filt)[1]
+        state_dim = self.model.state_dim
 
-        # Initialize with last filtered state
-        x_smooth = x_smooth.write(T - 1, x_filt[T - 1])
-        P_smooth = P_smooth.write(T - 1, P_filt[T - 1])
+        x_smooth_ta = tf.TensorArray(dtype=dtype, size=T, clear_after_read=False)
+        P_smooth_ta = tf.TensorArray(dtype=dtype, size=T, clear_after_read=False)
+        P_cross_ta = tf.TensorArray(dtype=dtype, size=tf.maximum(1, T - 1))
 
-        # range(T-2, -1, -1) means we iterate t from T-2 down to 0
+        x_smooth_ta = x_smooth_ta.write(T - 1, tf.expand_dims(x_filt[:, T - 1, :], -1))
+        P_smooth_ta = P_smooth_ta.write(T - 1, P_filt[:, T - 1, :, :])
+
         for t in tf.range(T - 2, -1, -1):
-            P_filt_t = P_filt[t]
-            P_pred_next = P_pred[t + 1]
+            P_filt_t = P_filt[:, t, :, :]
+            P_pred_next = P_pred[:, t + 1, :, :]
+            A_t = A_arr[:, t + 1, :, :]
 
-            # Jacobian for transition t -> t+1
-            # In the filter loop above, we wrote A_{t} at index t.
-            A_t = A_arr[t]
-            # Smoother Gain: J = P_{t|t} * A^T * P_{t+1|t}^{-1}
-            # Solve P_{t+1|t} * J^T = A * P_{t|t}
-            P_pred_next_chol = tf.linalg.cholesky(P_pred_next + 1e-6 * tf.eye(self.model.state_dim,dtype=dtype))
+            P_pred_next_chol = tf.linalg.cholesky(P_pred_next + 1e-6 * tf.eye(state_dim, dtype=dtype))
 
-            # J = (P_filt_t @ A_t.T) @ inv(P_pred_next)
-            # transpose(J) = inv(P_pred_next) @ (A_t @ P_filt_t)
-            J_transposed = tf.linalg.cholesky_solve(P_pred_next_chol, A_t @ P_filt_t)
-            J_t = tf.transpose(J_transposed)
+            J_transposed = tf.linalg.cholesky_solve(P_pred_next_chol, tf.matmul(A_t, P_filt_t))
+            J_t = tf.linalg.matrix_transpose(J_transposed)
 
-            x_next_smooth = x_smooth.read(t + 1)
-            P_next_smooth = P_smooth.read(t + 1)
+            x_next_smooth = x_smooth_ta.read(t + 1)
+            P_next_smooth = P_smooth_ta.read(t + 1)
 
-            x_curr = x_filt[t] + J_t @ (x_next_smooth - x_pred[t + 1])
-            P_curr = P_filt_t + J_t @ (P_next_smooth - P_pred_next) @ tf.transpose(J_t)
-            P_curr = 0.5 * (P_curr + tf.transpose(P_curr))  # Symmetrize
-            # Cross covariance P_{t+1, t | T} for EM
-            # Standard approx: P_{t+1, t | T} approx P_{t+1|T} J_t^T
-            P_cross_val = P_next_smooth @ tf.transpose(J_t)
+            dx = x_next_smooth - tf.expand_dims(x_pred[:, t + 1, :], -1)
+            x_curr = tf.expand_dims(x_filt[:, t, :], -1) + tf.matmul(J_t, dx)
 
-            x_smooth = x_smooth.write(t, x_curr)
-            P_smooth = P_smooth.write(t, P_curr)
-            P_cross = P_cross.write(t, P_cross_val)
+            dP = P_next_smooth - P_pred_next
+            P_curr = P_filt_t + tf.matmul(J_t, tf.matmul(dP, J_t, transpose_b=True))
+            P_curr = 0.5 * (P_curr + tf.linalg.matrix_transpose(P_curr))
 
-        return x_smooth.stack(), P_smooth.stack(), P_cross.stack(), log_l
+            P_cross_val = tf.matmul(P_next_smooth, J_t, transpose_b=True)
 
-    @tf.function
-    def batch_smooth(self, Y):
-        T = int(tf.shape(Y)[1])
-        return tf.vectorized_map(lambda seq: self.smooth(seq, T), Y)
+            x_smooth_ta = x_smooth_ta.write(t, x_curr)
+            P_smooth_ta = P_smooth_ta.write(t, P_curr)
+            P_cross_ta = P_cross_ta.write(t, P_cross_val)
 
-    def fit_EM(self, Y: tf.Tensor, n_iter: int = 10):
-        """
-        Infering model parameters (noise covariance matrices)
-        using EM on a batch of sequences.
-        """
-        # Ensure Y has 3 dims: [Batch, T, Obs]
+        x_smooth = tf.squeeze(tf.transpose(x_smooth_ta.stack(), perm=[1, 0, 2, 3]), axis=-1)
+        P_smooth = tf.transpose(P_smooth_ta.stack(), perm=[1, 0, 2, 3])
+        P_cross = tf.transpose(P_cross_ta.stack(), perm=[1, 0, 2, 3])
+
+        return x_smooth, P_smooth, P_cross, log_l
+
+    def fit(self, Y: tf.Tensor, n_iter: int = 10, **kwargs):
+        """EM Solver for Additive Noise EKF."""
         if len(Y.shape) == 2 and self.model.obs_dim == 1:
             Y = tf.expand_dims(Y, axis=-1)
 
@@ -227,374 +218,311 @@ class ExtendedKalmanFilter:
 
         total_samples = tf.cast(batch_size * T, dtype)
         total_transitions = tf.cast(batch_size * (T - 1), dtype)
-        # Get current values and ensure they are vectors [dim]
-        init_Q_std = self.model.process_noise.stddev()
-        if len(init_Q_std.shape) == 0:
-            init_Q_std = tf.fill([state_dim], init_Q_std)
-        else:
-            init_Q_std = tf.broadcast_to(init_Q_std, [state_dim])
 
-        init_R_std = self.model.observation_noise.stddev()
-        if len(init_R_std.shape) == 0:
-            init_R_std = tf.fill([obs_dim], init_R_std)
-        else:
-            init_R_std = tf.broadcast_to(init_R_std, [obs_dim])
+        init_Q_std = self._get_mean(self.model.process_noise.stddev(), state_dim)
+        init_R_std = self._get_mean(self.model.observation_noise.stddev(), obs_dim)
 
         Q_var = tf.Variable(init_Q_std, dtype=dtype)
         R_var = tf.Variable(init_R_std, dtype=dtype)
-        # Replace model distributions ONCE with variable-backed distributions
+
         self.model.process_noise = tfd.Normal(loc=tf.zeros(state_dim), scale=Q_var)
         self.model.observation_noise = tfd.Normal(loc=tf.zeros(obs_dim), scale=R_var)
 
         log_likelihoods = []
         for i in range(n_iter):
-            # E-Step: Run Smoothing on Batch
-            # Use vectorized_map or a custom batch_smooth function if defined
-            # Here we wrap the smooth function
-            x_smooth, P_smooth, P_cross, log_L = self.batch_smooth(Y)
-            mean_log_L = tf.reduce_mean(log_L)
+            x_smooth, P_smooth, P_cross, log_L = self.smooth(Y)
+            mean_log_L = float(tf.reduce_mean(log_L).numpy())
             log_likelihoods.append(mean_log_L)
-            if i>=1 and tf.abs(log_likelihoods[-1]-log_likelihoods[-2])<1e-3:
+
+            if i >= 1 and abs(log_likelihoods[-1] - log_likelihoods[-2]) < 1e-3:
                 print(f'EM converged at iteration {i}.')
                 break
 
-            # M-Step
             y_flat = tf.reshape(Y, [-1, obs_dim])
             x_flat = tf.reshape(x_smooth, [-1, state_dim])
             P_flat = tf.reshape(P_smooth, [-1, state_dim, state_dim])
-            # update R by R = 1/N * Sum (res*res.T + H*P*H.T)
-            zero_obs = tf.zeros([tf.shape(x_flat)[0], obs_dim])
-            h_val, H, _ = self._batch_linearize(self.model.observation_fn, x_flat, zero_obs)
 
-            res_y = tf.expand_dims(y_flat - h_val, -1)  # [N, Obs, 1]
-            term_R = res_y @ tf.transpose(res_y, perm=[0, 2, 1]) + \
-                     H @ P_flat @ tf.transpose(H, perm=[0, 2, 1])
+            # Update R
+            h_val, H = self._batch_linearize(self.model.observation_fn, x_flat)
+            res_y = tf.expand_dims(y_flat - h_val, -1)
+
+            # term_R calculation naturally assumes additive noise!
+            term_R = tf.matmul(res_y, res_y, transpose_b=True) + tf.matmul(H, tf.matmul(P_flat, H, transpose_b=True))
             new_R = tf.reduce_sum(term_R, axis=0) / total_samples
-            # Update Process Noise Q
-            # P_cross is [Batch, T-1, State, State]
+
+            # Update Q
             x_curr = x_smooth[:, :-1, :]
             x_next = x_smooth[:, 1:, :]
             P_curr = P_smooth[:, :-1, :, :]
             P_next = P_smooth[:, 1:, :, :]
+            P_cross_flat = tf.reshape(P_cross, [-1, state_dim, state_dim])
 
             x_curr_flat = tf.reshape(x_curr, [-1, state_dim])
             x_next_flat = tf.reshape(x_next, [-1, state_dim])
             P_curr_flat = tf.reshape(P_curr, [-1, state_dim, state_dim])
             P_next_flat = tf.reshape(P_next, [-1, state_dim, state_dim])
-            P_cross_flat = tf.reshape(P_cross, [-1, state_dim, state_dim])
 
-            zero_proc = tf.zeros([tf.shape(x_curr_flat)[0], state_dim])
-            f_val, A, _ = self._batch_linearize(self.model.transition_fn, x_curr_flat, zero_proc)
+            f_val, A = self._batch_linearize(self.model.transition_fn, x_curr_flat)
             res_x = tf.expand_dims(x_next_flat - f_val, -1)
 
-            term_Q = (res_x @ tf.transpose(res_x, perm=[0, 2, 1]) +
+            # term_Q calculation naturally assumes additive noise!
+            term_Q = (tf.matmul(res_x, res_x, transpose_b=True) +
                       P_next_flat +
-                      A @ P_curr_flat @ tf.transpose(A, perm=[0, 2, 1]) -
-                      P_cross_flat @ tf.transpose(A, perm=[0, 2, 1]) -
-                      A @ tf.transpose(P_cross_flat, perm=[0, 2, 1]))
+                      tf.matmul(A, tf.matmul(P_curr_flat, A, transpose_b=True)) -
+                      tf.matmul(P_cross_flat, A, transpose_b=True) -
+                      tf.matmul(A, P_cross_flat, transpose_b=True))
             new_Q = tf.reduce_sum(term_Q, axis=0) / total_transitions
-            new_R_std = tf.sqrt(tf.linalg.diag_part(new_R))
-            new_Q_std = tf.sqrt(tf.linalg.diag_part(new_Q))
 
-            Q_var.assign(new_Q_std)
-            R_var.assign(new_R_std)
+            Q_diag = tf.maximum(tf.linalg.diag_part(new_Q), 1e-6)
+            R_diag = tf.maximum(tf.linalg.diag_part(new_R), 1e-6)
+
+            Q_var.assign(tf.sqrt(Q_diag))
+            R_var.assign(tf.sqrt(R_diag))
+
+            if i % 10 == 0:
+                print(f"Iter {i}: Log-Likelihood={mean_log_L:.4f}")
+
         return log_likelihoods
 
 
+class UnscentedKalmanFilter(BaseFilter, tf.Module):
+    """
+    Unscented Kalman Filter (UKF) for Non-Linear State-Space Models.
 
-class UnscentedKalmanFilter(tf.Module):
-    def __init__(self, model:NLSSM, alpha=1e-3, beta=2.0, kappa=0.0,train_noise=False):
-        super(UnscentedKalmanFilter, self).__init__()
-        self.model = model
+    Inherits from BaseFilter. Uses the Unscented Transform (UT) to propagate
+    mean and covariance through non-linear functions.
+    """
+
+    def __init__(self, model: NLSSM, alpha=1e-3, beta=2.0, kappa=0.0, train_noise=False):
+        BaseFilter.__init__(self, model)
+        tf.Module.__init__(self)
+
         self.state_dim = model.state_dim
         self.obs_dim = model.obs_dim
-        # UKF Hyperparameters
+
+        # Core UKF Hyperparameters (Learnable)
         self.alpha = tf.Variable(alpha, dtype=dtype, name='ukf_alpha')
         self.beta = tf.Variable(beta, dtype=dtype, name='ukf_beta')
         self.kappa = tf.Variable(kappa, dtype=dtype, name='ukf_kappa')
 
-        # Noise Parameters (Trainable)
-        # defined as part of the model
+        # Noise Parameters (Learnable)
         self.train_noise = train_noise
         self.proc_log_scale = self._create_log_scale(model.process_noise, self.state_dim, 'proc')
         self.obs_log_scale = self._create_log_scale(model.observation_noise, self.obs_dim, 'obs')
 
-    def _create_log_scale(self, dist, dim, name):
-        """Helper to create trainable log-scale variables from existing distributions."""
-        if not self.train_noise:
-            return None
+        # NOTE: We DO NOT compute self.Wm, self.Wc, self.lam here anymore!
+        # Computing them here hides them from tf.GradientTape during the .fit() loop.
 
-        # Get initial value from model
-        if hasattr(dist, 'scale'):
-            val = dist.scale
-        elif hasattr(dist, 'stddev'):
+    def _create_log_scale(self, dist, dim, name):
+        """Helper to safely create trainable log-scale variables, bypassing LinearOperator errors."""
+        if not self.train_noise: return None
+
+        try:
             val = dist.stddev()
-        else:
-            val = 1.0
+        except (AttributeError, NotImplementedError):
+            try:
+                val = tf.sqrt(tf.linalg.diag_part(dist.covariance()))
+            except (AttributeError, NotImplementedError):
+                val = tf.ones([dim], dtype=dtype)
 
         val = tf.convert_to_tensor(val, dtype=dtype)
-        if len(val.shape) == 0: val = tf.fill([dim], val)
+        if len(val.shape) == 0:
+            val = tf.fill([dim], val)
 
-        # Initialize with log(val) for numerical stability
         return tf.Variable(tf.math.log(val + 1e-6), name=f'{name}_log_scale')
 
     def _compute_weights(self):
-        n = self.state_dim
-        lam = self.alpha ** 2 * (n + self.kappa) - n
-        Wm_0 = lam / (n + lam)
-        Wm_rest = 0.5 / (n + lam)
-        # Weights shape: [2*n + 1]
-        Wm = tf.concat([[Wm_0], tf.fill([2 * n], Wm_rest)], axis=0)
-        Wc_0 = Wm_0 + (1 - self.alpha ** 2 + self.beta)
-        Wc = tf.concat([[Wc_0], tf.fill([2 * n], Wm_rest)], axis=0)
+        """
+        Dynamically computes UT weights.
+        Because this is called inside the forward pass (via _init_state),
+        tf.GradientTape can track the exact mathematical relationship
+        between the trainable parameters (alpha, beta, kappa) and the outputs.
+        """
+        n_float = tf.cast(self.state_dim, dtype)
+        lam = (self.alpha ** 2) * (n_float + self.kappa) - n_float
+
+        Wm_0 = lam / (n_float + lam)
+        Wm_rest = 0.5 / (n_float + lam)
+        # Multiplying by tf.ones ensures the gradient flows cleanly through the vector creation
+        Wm_rest_vec = tf.ones([2 * self.state_dim], dtype=dtype) * Wm_rest
+        Wm = tf.concat([[Wm_0], Wm_rest_vec], axis=0)
+
+        Wc_0 = Wm_0 + (1.0 - self.alpha ** 2 + self.beta)
+        Wc = tf.concat([[Wc_0], Wm_rest_vec], axis=0)
         return Wm, Wc, lam
 
-    @staticmethod
-    def _get_mean(dist, dim):
+    def _init_state(self, batch_size: int) -> tuple:
         """
-        Safely extracts the mean from a distribution.
+        Initializes the tracking state at t=0.
+
+        DESIGN CHOICE: The "Opaque State" Tuple
+        To avoid recomputing the static UT weights at every single time step,
+        we compute them EXACTLY ONCE here at the beginning of the sequence.
+        We then pack them into the state tuple. Because BaseFilter treats the
+        state tuple as opaque, it simply passes these weights along the time
+        loop to `predict` and `update` without any extra overhead.
         """
-        try:
-            # Most TFP distributions implement .mean()
-            mean = dist.mean()
-        except (AttributeError, NotImplementedError):
-            # Fallback: if mean is not defined, assume 0 (e.g. simple centered noise)
-            mean = tf.zeros([dim])
+        x_init = tf.tile(tf.reshape(self.model.x0, [1, self.state_dim]), [batch_size, 1])
+        P_init = tf.tile(tf.expand_dims(self._get_cov(self.model.init_noise), 0), [batch_size, 1, 1])
 
-        mean = tf.convert_to_tensor(mean, dtype=dtype)
-        # If mean is scalar (e.g. 0.0), broadcast to [Dim]
-        if len(mean.shape) == 0:
-            mean = tf.fill([dim], mean)
-        return mean
-
-    @staticmethod
-    def _get_cov(dist, log_scale_var=None):
-        """
-        Computes covariance. Prioritizes the trainable variable if it exists.
-        """
-        if log_scale_var is not None:
-            # Use the trainable variable: Variance = exp(log_scale)^2
-            scale = tf.exp(log_scale_var)
-            return tf.linalg.diag(tf.square(scale))
-
-        # Fallback to the fixed distribution object
-        try:
-            cov = dist.covariance()
-        except (AttributeError, NotImplementedError):
-            var = dist.variance()
-            if len(var.shape) == 0: var = tf.reshape(var, [1])
-            cov = tf.linalg.diag(var)
-
-        if len(cov.shape) == 0:
-            cov = tf.reshape(cov, [1, 1])
-        elif len(cov.shape) == 1:
-            cov = tf.linalg.diag(cov)
-        return tf.cast(cov, dtype=dtype)
-
-    def initialize_filter(self,batch_size:int):
-        Q = self._get_cov(self.model.process_noise, self.proc_log_scale)
-        R = self._get_cov(self.model.observation_noise, self.obs_log_scale)
-        P0 = self._get_cov(self.model.init_noise)
+        # 1. Compute weights dynamically ONCE per sequence run
         Wm, Wc, lam = self._compute_weights()
 
-        q_mean = self._get_mean(self.model.process_noise, self.state_dim)
-        r_mean = self._get_mean(self.model.observation_noise, self.obs_dim)
+        # 2. Pack them into the 7-tuple state
+        return (x_init, P_init, x_init, P_init, Wm, Wc, lam)
 
-        # Initialize State [Batch, State]
-        x_init = tf.reshape(self.model.x0, [1, self.state_dim])
-        x_init = tf.tile(x_init, [batch_size, 1])
-
-        # Initialize Covariance [Batch, State, State]
-        P_init = tf.expand_dims(P0, 0)
-        P_init = tf.tile(P_init, [batch_size, 1, 1])
-        return x_init, P_init, Wm, Wc, lam, Q, R, q_mean, r_mean
+    def _init_trajectory(self, time_steps: int) -> tuple:
+        # BaseFilter only needs history for the actual tracking states, not the static weights
+        x_filt_ta = tf.TensorArray(dtype, size=time_steps)
+        P_filt_ta = tf.TensorArray(dtype, size=time_steps)
+        x_pred_ta = tf.TensorArray(dtype, size=time_steps)
+        P_pred_ta = tf.TensorArray(dtype, size=time_steps)
+        logl_ta = tf.TensorArray(dtype, size=time_steps)
+        return (x_filt_ta, P_filt_ta, x_pred_ta, P_pred_ta, logl_ta)
 
     def _generate_sigma_points(self, x, P, lam):
-        # x: [Batch, Dim]
-        # P: [Batch, Dim, Dim]
         n = self.state_dim
-        scale = tf.sqrt(tf.cast(n + lam, dtype))
-        P_sym = 0.5 * (P + tf.linalg.matrix_transpose(P)) + 1e-6 * tf.eye(n,dtype=dtype)
-        L = tf.linalg.cholesky(P_sym)  # [Batch, n, n] Lower triangular
-        scaled_L = scale * L  # [Batch, n, n]
+        scale = tf.sqrt(tf.cast(n, dtype) + lam)
+        P_sym = 0.5 * (P + tf.linalg.matrix_transpose(P)) + 1e-6 * tf.eye(n, dtype=dtype)
+        L = tf.linalg.cholesky(P_sym)
+        scaled_L = scale * L
 
-        # 2. Broadcasting trick to avoid loops
-        # x shape: [Batch, n] -> [Batch, n, 1]
         x_expanded = tf.expand_dims(x, -1)
-
-        # [Batch, n, 1] + [Batch, n, n] -> [Batch, n, n] (Broadcasts x across columns)
         right = x_expanded + scaled_L
         left = x_expanded - scaled_L
         sigmas_concat = tf.concat([x_expanded, right, left], axis=2)
-        # [Batch, 2n+1, Dim]
         return tf.transpose(sigmas_concat, perm=[0, 2, 1])
 
     def _compute_stats(self, sigma_points, Wm, Wc, noise_cov):
-        # sigma_points: [Batch, 2n+1, Dim]
-        # Wm, Wc: [2n+1]
-
-        # Weighted Mean: Sum over sigma point dim (axis 1)
-        # Wm is 1D, we broadcast it.
-        x_mean = tf.tensordot(sigma_points, Wm, axes=[[1], [0]])  # [Batch, Dim]
-        residuals = sigma_points - tf.expand_dims(x_mean, 1)  # [Batch, 2n+1, Dim]
-
+        x_mean = tf.tensordot(sigma_points, Wm, axes=[[1], [0]])
+        residuals = sigma_points - tf.expand_dims(x_mean, 1)
         Wc_b = tf.reshape(Wc, [1, -1, 1])
-        weighted_res = residuals * Wc_b  # [Batch, 2n+1, Dim]
-
-        # Batch matmul: (B, Dim, 2n+1) @ (B, 2n+1, Dim) -> (B, Dim, Dim)
-        P = tf.matmul(tf.transpose(weighted_res, perm=[0, 2, 1]), residuals)+noise_cov
+        weighted_res = residuals * Wc_b
+        P = tf.matmul(tf.transpose(weighted_res, perm=[0, 2, 1]), residuals) + noise_cov
         P = 0.5 * (P + tf.linalg.matrix_transpose(P))
         return x_mean, P, residuals
 
-    def predict_step(self, x_curr, P_curr, Wm, Wc, lam, Q, noise_proc_mean):
-        sig_pts = self._generate_sigma_points(x_curr, P_curr, lam)  # [Batch, 2n+1, n]
+    def predict(self, t: int, state: tuple) -> tuple:
+        # Unpack the dynamically computed weights passed from the previous step
+        x_filt_prev, P_filt_prev, _, _, Wm, Wc, lam = state
 
-        # Flatten batch and sigma dims to ensure compatibility with NLSSM model
+        Q = tf.expand_dims(self._get_cov(self.model.process_noise, self.proc_log_scale), 0)
+        q_mean = self._get_mean(self.model.process_noise, self.state_dim)
+
+        # Use the weights normally
+        sig_pts = self._generate_sigma_points(x_filt_prev, P_filt_prev, lam)
         batch_size = tf.shape(sig_pts)[0]
         num_sig = tf.shape(sig_pts)[1]
-        sig_pts_flat = tf.reshape(sig_pts, [batch_size * num_sig, self.state_dim])
 
-        # [Batch_Total, Dim]
-        sig_pts_prop_flat = self.model.transition_fn(sig_pts_flat, noise_proc_mean)
+        sig_pts_flat = tf.reshape(sig_pts, [batch_size * num_sig, self.state_dim])
+        sig_pts_prop_flat = self.model.transition_fn(sig_pts_flat, q_mean)
         sig_pts_prop = tf.reshape(sig_pts_prop_flat, [batch_size, num_sig, self.state_dim])
 
         x_pred, P_pred, _ = self._compute_stats(sig_pts_prop, Wm, Wc, Q)
         P_pred = 0.5 * (P_pred + tf.linalg.matrix_transpose(P_pred))
-        return x_pred, P_pred, sig_pts_prop
 
-    def update_step(self, x_pred, P_pred, y, Wm, Wc, lam, R, noise_obs_mean):
-        # y: [Batch, Obs]
+        # Re-pack the weights into the 7-tuple so `update` can use them
+        return (x_pred, P_pred, x_pred, P_pred, Wm, Wc, lam)
 
+    def update(self, t: int, state: tuple, observation: tf.Tensor) -> tuple:
+        # Unpack the dynamically computed weights passed from the predict step
+        _, _, x_pred, P_pred, Wm, Wc, lam = state
+
+        R = tf.expand_dims(self._get_cov(self.model.observation_noise, self.obs_log_scale), 0)
+        r_mean = self._get_mean(self.model.observation_noise, self.obs_dim)
+
+        # Use the weights normally
         sig_pts_pred = self._generate_sigma_points(x_pred, P_pred, lam)
         batch_size = tf.shape(sig_pts_pred)[0]
         num_sig = tf.shape(sig_pts_pred)[1]
-        sig_pts_pred_flat = tf.reshape(sig_pts_pred, [batch_size * num_sig, self.state_dim])
 
-        sig_pts_obs_flat = self.model.observation_fn(sig_pts_pred_flat, noise_obs_mean)
+        sig_pts_pred_flat = tf.reshape(sig_pts_pred, [batch_size * num_sig, self.state_dim])
+        sig_pts_obs_flat = self.model.observation_fn(sig_pts_pred_flat, r_mean)
         sig_pts_obs = tf.reshape(sig_pts_obs_flat, [batch_size, num_sig, self.obs_dim])
 
         y_pred_mean, S, y_residuals = self._compute_stats(sig_pts_obs, Wm, Wc, R)
         x_residuals = sig_pts_pred - tf.expand_dims(x_pred, 1)
         Wc_b = tf.reshape(Wc, [1, -1, 1])
         weighted_x_res = x_residuals * Wc_b
-        # [Batch, State, Obs]
+
         P_xy = tf.matmul(tf.transpose(weighted_x_res, perm=[0, 2, 1]), y_residuals)
+        S_chol = tf.linalg.cholesky(S + 1e-6 * tf.eye(self.obs_dim, dtype=dtype))
 
-        # S_chol: [Batch, Obs, Obs]
-        S_chol = tf.linalg.cholesky(S + 1e-6 * tf.eye(self.obs_dim,dtype=dtype))
-
-        # Solve S * K^T = P_xy^T  => K^T = S^-1 P_xy^T
-        # Input  [Batch, Obs, State]
         Kt_transposed = tf.linalg.cholesky_solve(S_chol, tf.linalg.matrix_transpose(P_xy))
-        K = tf.linalg.matrix_transpose(Kt_transposed)  # [Batch, State, Obs]
-        innovation = y - y_pred_mean  # [Batch, Obs]
-        innovation_expanded = tf.expand_dims(innovation, -1)  # [Batch, Obs, 1]
-        x_update = tf.matmul(K, innovation_expanded)
-        x_new = x_pred + tf.squeeze(x_update, -1)
-        # P_new = P_pred - K S K^T
-        # KSKt = K @ S @ K.T
+        K = tf.linalg.matrix_transpose(Kt_transposed)
+
+        innovation = observation - y_pred_mean
+        innovation_expanded = tf.expand_dims(innovation, -1)
+
+        x_new = x_pred + tf.squeeze(tf.matmul(K, innovation_expanded), -1)
         KSKt = tf.matmul(K, tf.matmul(S, K, transpose_b=True))
         P_new = P_pred - KSKt
         P_new = 0.5 * (P_new + tf.linalg.matrix_transpose(P_new))
 
-        const_term = tf.cast(-0.5 * float(self.obs_dim), dtype) * tf.math.log(tf.constant(2 * math.pi, dtype=dtype))
-        diag_S=tf.maximum(tf.linalg.diag_part(S_chol),1e-6)
+        const_term = -0.5 * float(self.obs_dim) * tf.math.log(2 * math.pi)
+        diag_S = tf.maximum(tf.linalg.diag_part(S_chol), 1e-6)
         log_det_S = 2 * tf.reduce_sum(tf.math.log(diag_S), axis=1)
         sol = tf.linalg.cholesky_solve(S_chol, innovation_expanded)
         quad_term = tf.squeeze(tf.matmul(tf.transpose(innovation_expanded, perm=[0, 2, 1]), sol), [1, 2])
-        log_l = const_term - 0.5 * log_det_S - 0.5 * quad_term  # [Batch]
-        # print('\n')
-        # print('const: ',const_term)
-        # print('log_det_S: ',log_det_S)
-        # print('quad_term: ',quad_term)
-        # print('min diag S_chol: ',tf.reduce_min(tf.linalg.diag_part(S_chol)))
+        log_l = const_term - 0.5 * log_det_S - 0.5 * quad_term
 
-        return x_new, P_new, log_l
+        # Re-pack the weights into the 7-tuple for the next time step t+1
+        return (x_new, P_new, x_pred, P_pred, Wm, Wc, lam), (log_l,)
 
-    @tf.function
-    def filter(self, y: tf.Tensor, py_loop=False):
-        """
-        Batch-enabled UKF Filter.
-        :param y: Observations [Batch, T, Obs]
-                  Input MUST be standardized to Rank 3 before calling this method.
-        """
-        # Standardize input to [Batch, T, Obs]
-        y = tf.convert_to_tensor(y, dtype=dtype)
-        batch_size = tf.shape(y)[0]
+    def forecast(self, observations: tf.Tensor) -> tuple:
+        res = self.filter(observations)
+        x_filt_last = res['x_filt'][:, -1, :]
+        P_filt_last = res['P_filt'][:, -1, :, :]
 
-        Q = self._get_cov(self.model.process_noise, self.proc_log_scale)
-        R = self._get_cov(self.model.observation_noise, self.obs_log_scale)
-        P0 = self._get_cov(self.model.init_noise)
+        # Need weights locally to push the final state into T+1
         Wm, Wc, lam = self._compute_weights()
 
-        q_mean = self._get_mean(self.model.process_noise, self.state_dim)
+        state_last = (x_filt_last, P_filt_last, None, None, Wm, Wc, lam)
+        x_pred_next, P_pred_next, _, _, _, _, _ = self.predict(0, state_last)
+
+        R = tf.expand_dims(self._get_cov(self.model.observation_noise, self.obs_log_scale), 0)
         r_mean = self._get_mean(self.model.observation_noise, self.obs_dim)
 
-        # Initialize State [Batch, State]
-        x_init = tf.reshape(self.model.x0, [1, self.state_dim])
-        x_init = tf.tile(x_init, [batch_size, 1])
+        sig_pts_pred = self._generate_sigma_points(x_pred_next, P_pred_next, lam)
+        batch_size, num_sig = tf.shape(sig_pts_pred)[0], tf.shape(sig_pts_pred)[1]
 
-        # Initialize Covariance [Batch, State, State]
-        P_init = tf.expand_dims(P0, 0)
-        P_init = tf.tile(P_init, [batch_size, 1, 1])
+        sig_pts_pred_flat = tf.reshape(sig_pts_pred, [batch_size * num_sig, self.state_dim])
+        sig_pts_obs_flat = self.model.observation_fn(sig_pts_pred_flat, r_mean)
+        sig_pts_obs = tf.reshape(sig_pts_obs_flat, [batch_size, num_sig, self.obs_dim])
 
-        # Transpose y to [T, Batch, Obs] for scanning over time
-        y_time_major = tf.transpose(y, perm=[1, 0, 2])
-        x_0, P_0, log_l_0 = self.update_step(x_init, P_init, y_time_major[0], Wm, Wc, lam, R, r_mean)
+        y_pred_next, S_next, _ = self._compute_stats(sig_pts_obs, Wm, Wc, R)
 
-        # Carry: (x_curr, P_curr, accum_log_l)
-        #@tf.function
-        def scan_step(carry, y_t):
-            x_prev, P_prev, _ = carry
-            x_pred, P_pred, _ = self.predict_step(x_prev, P_prev, Wm, Wc, lam, Q, q_mean)
-            x_filt, P_filt, log_l_t = self.update_step(x_pred, P_pred, y_t, Wm, Wc, lam, R, r_mean)
-            return x_filt, P_filt, log_l_t
+        return y_pred_next, S_next
 
-        if not py_loop:
-            y_rest = y_time_major[1:]
-            # Output of scan is stacked over time: [T-1, Batch, ...]
-            x_rest, P_rest, log_l_rest = tf.scan(
-                scan_step,
-                y_rest,
-                initializer=(x_0, P_0, log_l_0)
-            )
+    def _write_trajectory(self, t: int, trajectory: tuple, state: tuple, metrics: tuple) -> tuple:
+        x_filt_ta, P_filt_ta, x_pred_ta, P_pred_ta, logl_ta = trajectory
 
-            x_hist = tf.concat([tf.expand_dims(x_0, 0), x_rest], axis=0)  # [T, Batch, State]
-            P_hist = tf.concat([tf.expand_dims(P_0, 0), P_rest], axis=0)  # [T, Batch, State, State]
-            log_l_hist = tf.concat([tf.expand_dims(log_l_0, 0), log_l_rest], axis=0)  # [T, Batch]
+        # We unpack the 7-tuple but ignore the UT weights (Wm, Wc, lam).
+        # We do not need to save the static weights to the time-series history arrays.
+        x_filt, P_filt, x_pred, P_pred, _, _, _ = state
+        log_l = metrics[0]
 
-            x_hist = tf.transpose(x_hist, perm=[1, 0, 2]) # [Batch, T, State]
-            P_hist = tf.transpose(P_hist, perm=[1, 0, 2, 3])
-            log_l_hist = tf.transpose(log_l_hist, perm=[1, 0]) # [Batch, T]
-            return x_hist, P_hist,tf.reduce_sum(log_l_hist,axis=-1) # [Batch]
-        else:
-            T=tf.shape(y_time_major)[0]
-            log_l_ta=tf.TensorArray(dtype=dtype, size=T)
-            log_l_ta=log_l_ta.write(0,log_l_0)
-            x,P,log_l=x_0,P_0,log_l_0
-            x_ta=tf.TensorArray(dtype=dtype, size=T)
-            P_ta=tf.TensorArray(dtype=dtype, size=T)
-            x_ta=x_ta.write(0,x)
-            P_ta=P_ta.write(0,P)
-            for t in range(1,T):
-                x, P, log_l = scan_step((x, P, log_l), y_time_major[t])
-                log_l_ta=log_l_ta.write(t,log_l)
-                x_ta=x_ta.write(t,x)
-                P_ta=P_ta.write(t,P)
-            x_hist=x_ta.stack() # [T, Batch, State]
-            x_hist = tf.transpose(x_hist, perm=[1, 0, 2]) # [Batch, T, State]
-            P_hist=P_ta.stack() # [T, Batch, State, State]
-            P_hist = tf.transpose(P_hist, perm=[1, 0, 2, 3]) # [Batch, T, State, State]
-            log_l_hist=log_l_ta.stack() # [T, Batch]
-            log_l_hist = tf.transpose(log_l_hist, perm=[1, 0]) # [Batch, T]
-            return x_hist, P_hist, tf.reduce_sum(log_l_hist,axis=-1) # [Batch]
+        return (
+            x_filt_ta.write(t, x_filt), P_filt_ta.write(t, P_filt),
+            x_pred_ta.write(t, x_pred), P_pred_ta.write(t, P_pred),
+            logl_ta.write(t, log_l)
+        )
 
-    def fit(self, y_batch: tf.Tensor, n_iter=100, learning_rate=0.01,py_loop=False):
-        y_batch = tf.convert_to_tensor(y_batch, dtype=dtype)
-        if len(y_batch.shape) == 2:
-            y_batch = tf.expand_dims(y_batch, -1)
-        elif len(y_batch.shape) == 1:
-            y_batch = tf.reshape(y_batch, [1, -1, 1])
+    def _format_output(self, trajectory: tuple) -> dict:
+        x_filt_ta, P_filt_ta, x_pred_ta, P_pred_ta, logl_ta = trajectory
+
+        return {
+            "x_filt": tf.transpose(x_filt_ta.stack(), perm=[1, 0, 2]),
+            "P_filt": tf.transpose(P_filt_ta.stack(), perm=[1, 0, 2, 3]),
+            "x_pred": tf.transpose(x_pred_ta.stack(), perm=[1, 0, 2]),
+            "P_pred": tf.transpose(P_pred_ta.stack(), perm=[1, 0, 2, 3]),
+            "log_likelihood": tf.reduce_sum(tf.transpose(logl_ta.stack(), perm=[1, 0]), axis=-1)
+        }
+
+    def fit(self, Y: tf.Tensor, n_iter=100, learning_rate=0.01):
+        """Backpropagation through time (BPTT) using BaseFilter loop."""
+        Y = tf.convert_to_tensor(Y, dtype=dtype)
+        if len(Y.shape) == 2: Y = tf.expand_dims(Y, -1)
 
         trainable_vars = [self.alpha, self.beta, self.kappa]
         if self.proc_log_scale is not None: trainable_vars.append(self.proc_log_scale)
@@ -602,54 +530,40 @@ class UnscentedKalmanFilter(tf.Module):
 
         optimizer = tf.optimizers.Adam(learning_rate)
 
+        @tf.function
         def train_step():
             with tf.GradientTape() as tape:
-                # Run filter on the WHOLE batch at once
-                _, _, log_likelihoods = self.filter(y_batch, py_loop)
-                loss = -tf.reduce_mean(log_likelihoods)
-
+                results = self.filter(Y)
+                loss = -tf.reduce_mean(results['log_likelihood'])
             grads = tape.gradient(loss, trainable_vars)
-            grads = [tf.clip_by_norm(g, 1.0) for g in grads]
-            optimizer.apply_gradients(zip(grads, trainable_vars))
+
+            # SAFEGUARD: Gracefully ignore parameters that return a None gradient.
+            # This prevents tf.clip_by_norm from crashing if a parameter path is detached.
+            valid_grads = []
+            valid_vars = []
+            for g, v in zip(grads, trainable_vars):
+                if g is not None:
+                    valid_grads.append(tf.clip_by_norm(g, 1.0))
+                    valid_vars.append(v)
+
+            optimizer.apply_gradients(zip(valid_grads, valid_vars))
             return loss
 
-        losses=[]
+        losses = []
         for i in range(n_iter):
             loss_tensor = train_step()
-            loss_numpy = loss_tensor.numpy()
-            # SAFE LOGGING: Handle both Scalar and Vector cases to prevent crash
-            if loss_numpy.ndim == 0:
-                # It is a scalar (ideal case)
-                scalar_loss = float(loss_numpy.item())
-            else:
-                # It is a vector (fallback) - take mean
-                scalar_loss = float(loss_numpy.mean())
+            scalar_loss = float(loss_tensor.numpy().item() if loss_tensor.ndim == 0 else loss_tensor.numpy().mean())
             losses.append(scalar_loss)
+            if i % 10 == 0: print(f"Iter {i}: Loss={scalar_loss:.4f}")
 
-            if i % 10 == 0:
-                print(f"Iter {i}: Loss={scalar_loss:.4f}")
         self.sync_model()
         return losses
 
     def sync_model(self):
-        """
-        Updates the internal NLSSM model object with the learned noise parameters.
-        """
+        """Updates the internal NLSSM model object with the learned noise parameters."""
         if self.proc_log_scale is not None:
             learned_std = tf.exp(self.proc_log_scale)
-            # Create a new distribution with the learned scale
-            # Assuming Normal distribution for simplicity, adapt if using StudentT
-            self.model.process_noise = tfd.Normal(
-                loc=tf.zeros_like(learned_std),
-                scale=learned_std
-            )
+            self.model.process_noise = tfd.Normal(loc=tf.zeros_like(learned_std), scale=learned_std)
         if self.obs_log_scale is not None:
             learned_std = tf.exp(self.obs_log_scale)
-            self.model.observation_noise = tfd.Normal(
-                loc=tf.zeros_like(learned_std),
-                scale=learned_std
-            )
-
-
-
-
+            self.model.observation_noise = tfd.Normal(loc=tf.zeros_like(learned_std), scale=learned_std)

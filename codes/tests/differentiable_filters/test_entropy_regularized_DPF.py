@@ -5,8 +5,8 @@ import unittest
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-from codes.Filters.differentiable_filters.entropy_regularized_OT import DifferentiableParticleFilter
-from codes.models.base_models import LearnableSSM
+from Filters.differentiable_filters.entropy_regularized_OT import DifferentiableParticleFilter
+from models.base_models import LearnableSSM
 
 tfd = tfp.distributions
 

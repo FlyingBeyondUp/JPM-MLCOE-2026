@@ -4,11 +4,11 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 # Assuming your new class is saved in optimal_pfpf.py
-from codes.Filters.flow_filters.optimal_path_invertible_flow import OptimalInvertiblePFPF
-from codes.Filters.flow_filters.invertible_flow_ekf import ParticleUKF
+from Filters.flow_filters.optimal_path_invertible_flow import OptimalInvertiblePFPF
+from Filters.flow_filters.invertible_flow_ekf import ParticleUKF
 from models import get1DLogSquaredSVM
-from codes.Filters.basic_filters import UnscentedKalmanFilter
-from codes.Filters.flow_filters import EDHFlow, LEDHFlow
+from Filters.basic_filters import UnscentedKalmanFilter
+from Filters.flow_filters import EDHFlow, LEDHFlow
 
 
 class TestOptimalInvertiblePFPF(tf.test.TestCase):

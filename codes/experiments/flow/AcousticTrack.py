@@ -7,10 +7,10 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 import scipy.linalg
 
-from codes.Filters.basic_filters import KalmanFilter, UnscentedKalmanFilter, ExtendedKalmanFilter, ParticleFilter
+from Filters.basic_filters import KalmanFilter, UnscentedKalmanFilter, ExtendedKalmanFilter, ParticleFilter
 from models import LGSSM, NLSSM
-from codes.Filters.flow_filters import EDHFlow, LEDHFlow
-from codes.Filters.flow_filters.invertible_flow_ekf import InvertiblePFPF
+from Filters.flow_filters import EDHFlow, LEDHFlow
+from Filters.flow_filters.invertible_flow_ekf import InvertiblePFPF
 
 tfd = tfp.distributions
 
@@ -391,7 +391,6 @@ def run_experiment_A_replication(T=40, batch_size=10, num_particles_pf=500, num_
             time_res['BPF'] += (time.time() - t0)
             omat_res['BPF'][b, i, :] = batch_compute_omat(x_true_b, x_filt_bpf)[0]
             ess_res['BPF'][b, i, :] = ess_bpf[0]
-            print('finished BPF')
 
 
             if b == 0 and i == 0:
@@ -423,7 +422,7 @@ def run_experiment_A_replication(T=40, batch_size=10, num_particles_pf=500, num_
     plt.title('Average OMAT Error at Each Time Step (Figure 2 Replication)')
     plt.legend()
     plt.grid(True)
-    #plt.savefig("Figures/Fig2_OMAT.pdf", bbox_inches='tight')
+    plt.savefig("Figures/Fig2_OMAT.pdf", bbox_inches='tight')
     plt.show()
 
     # Plot Figure 4: Average ESS over time
@@ -436,7 +435,7 @@ def run_experiment_A_replication(T=40, batch_size=10, num_particles_pf=500, num_
     plt.title('Average Effective Sample Size at Each Time Step (Figure 4 Replication)')
     plt.legend()
     plt.grid(True)
-    #plt.savefig("Figures/Fig4_ESS.pdf", bbox_inches='tight')
+    plt.savefig("Figures/Fig4_ESS.pdf", bbox_inches='tight')
     plt.show()
 
 
@@ -445,5 +444,5 @@ if __name__ == "__main__":
     tf.config.experimental.enable_tensor_float_32_execution(False)
 
     # Paper uses batch=100 trajectories, T=40.
-    run_experiment_A_replication(T=40, batch_size=1, num_particles_pf=500, num_particles_bpf=100000,
+    run_experiment_A_replication(T=40, batch_size=10, num_particles_pf=500, num_particles_bpf=100000,
                                  iter_per_sample=5)

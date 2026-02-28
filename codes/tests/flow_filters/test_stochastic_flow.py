@@ -2,7 +2,7 @@ import unittest
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-from codes.Filters.flow_filters.stochastic_flow import StochasticFlow
+from Filters.flow_filters.stochastic_flow import StochasticFlow
 
 tfd = tfp.distributions
 

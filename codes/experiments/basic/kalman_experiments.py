@@ -1,8 +1,8 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib.pyplot as plt
-from base_models import LGSSM
-from kalman_filter import KalmanFilter, EM_initializer, EM_solver
+from models.base_models import LGSSM
+from Filters.basic_filters.kalman_filter import KalmanFilter, EM_initializer, EM_solver
 import math
 
 tfd = tfp.distributions
@@ -87,6 +87,22 @@ def check_condition_number_impact(T=200, state_dim=10, obs_dim=10):
 
 
 def show_EM_example(num_trials=64, T=100, state_dim=3, obs_dim=3, max_iters=50, stabilization=True):
+    '''
+    # compare the estimated parameters with the true parameters
+    Due to the identifiability issue of LGSSM, the estimated parameters may differ from
+    the true parameters by a linear transformation significantly even if the inference of latent variables is sound.
+
+    true_params=data_generator.get_params()
+    est_params=kf.model.get_params()
+    param_names=['A','C','Q','R','x0','P0']
+    for i in range(len(true_params)):
+        true_param=true_params[i]
+        est_param=est_params[i]
+        param_name=param_names[i]
+        param_error=tf.norm(true_param - est_param) / (tf.norm(true_param) + 1e-9)
+        print(f'Parameter {param_name} relative error: {param_error.numpy():.4f}')
+    '''
+
     data_generator = LGSSM(state_dim, obs_dim)
     X, Y = data_generator.batch_sample(T=T, batch_size=num_trials)
     kf = EM_initializer(Y, state_dim)
@@ -136,21 +152,7 @@ def show_EM_example(num_trials=64, T=100, state_dim=3, obs_dim=3, max_iters=50, 
     print("True Moduli:          ", tf.abs(eig_true_sorted).numpy())
     print("Estimated Moduli:     ", tf.abs(eig_est_sorted).numpy())
 
-    '''
-    # compare the estimated parameters with the true parameters
-    Due to the identifiability issue of LGSSM, the estimated parameters may differ from 
-    the true parameters by a linear transformation significantly even if the inference of latent variables is sound.
 
-    true_params=data_generator.get_params()
-    est_params=kf.model.get_params()
-    param_names=['A','C','Q','R','x0','P0']
-    for i in range(len(true_params)):
-        true_param=true_params[i]
-        est_param=est_params[i]
-        param_name=param_names[i]
-        param_error=tf.norm(true_param - est_param) / (tf.norm(true_param) + 1e-9)
-        print(f'Parameter {param_name} relative error: {param_error.numpy():.4f}')
-    '''
 
 
 def test_filter(num_trials=128, T=50, state_dim=3, obs_dim=3):
@@ -322,3 +324,4 @@ def run_comparison_example():
 
 if __name__ == "__main__":
     check_condition_number_impact()
+    show_EM_example()

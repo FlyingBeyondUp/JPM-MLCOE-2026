@@ -1,6 +1,6 @@
 from models import *
-from kalman_filter import KalmanFilter
-from nonlinear_filters import ExtendedKalmanFilter, UnscentedKalmanFilter
+from Filters.basic_filters import KalmanFilter
+from Filters.basic_filters import ExtendedKalmanFilter, UnscentedKalmanFilter
 import matplotlib.pyplot as plt
 import time
 import tensorflow as tf
