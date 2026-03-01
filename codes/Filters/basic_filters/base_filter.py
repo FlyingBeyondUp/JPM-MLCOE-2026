@@ -120,7 +120,23 @@ class BaseFilter(abc.ABC):
         state = self._init_state(batch_size)
         trajectory = self._init_trajectory(time_steps)
 
+        # 1. Helper to dynamically relax the batch dimension (axis 0) to None
+        def _get_invariant(x):
+            if not isinstance(x, tf.Tensor):
+                return None
+            if len(x.shape) == 0:  # Handle scalars (like 'lam')
+                return tf.TensorShape([])
+            return tf.TensorShape([None] + x.shape[1:])
+
+        # 2. Map the helper across whatever complex tuple 'state' happens to be
+        state_invariants = tf.nest.map_structure(_get_invariant, state)
+
         for t in tf.range(time_steps):
+            # 3. COMPILER FIX: Enforce dynamic batching for the entire filter lifecycle
+            tf.autograph.experimental.set_loop_options(
+                shape_invariants=[(state, state_invariants)]
+            )
+
             y_t = y_time_major[t]
 
             state = tf.cond(
@@ -131,10 +147,6 @@ class BaseFilter(abc.ABC):
 
             state, metrics = self.update(t, state, y_t)
 
-            # Note: We MUST reassign the `trajectory` variable here.
-            # Because we are inside a @tf.function, this reassignment tells the AutoGraph
-            # compiler that step t+1 strictly depends on the memory state produced by step t.
-            # Without this reassignment, the graph drops the writes, resulting in empty arrays.
             trajectory = self._write_trajectory(t, trajectory, state, metrics)
 
         return self._format_output(trajectory)
