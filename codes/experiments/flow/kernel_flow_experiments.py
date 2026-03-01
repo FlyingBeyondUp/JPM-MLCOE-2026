@@ -5,7 +5,8 @@ from Filters.flow_filters import KernelPFF
 from models import getLorenz96Model
 from scipy.stats import multivariate_normal
 
-dtype = tf.float64
+# MODIFICATION: Standardize to float32 to match the base models and framework
+dtype = tf.float32
 tf.random.set_seed(42)
 np.random.seed(42)
 
@@ -47,7 +48,7 @@ def replicate_figure_3():
 
     prior = tf.expand_dims(prior_t1000, 0)
 
-    y_true = l96.observation_fn(x_true, tf.zeros((1,250),dtype=dtype))
+    y_true = l96.observation_fn(x_true, tf.zeros((1,250), dtype=dtype))
     y_obs = y_true + tf.random.normal(y_true.shape, stddev=0.5, dtype=dtype)
 
     # 3. Run Filters
@@ -55,12 +56,14 @@ def replicate_figure_3():
     num_flow_steps = 200
     step_sizes = tf.ones(num_flow_steps, dtype=dtype) * 0.05
 
-    pff_mat = KernelPFF(l96, N, kernel_type='matrix')
-    post_mat = pff_mat._flow_update(y_obs, prior, num_flow_steps, step_sizes=step_sizes)
+    # MODIFICATION: Pass flow hyperparams to constructor and unpack 3-tuple return
+    pff_mat = KernelPFF(l96, N, num_flow_steps=num_flow_steps, step_sizes=step_sizes, kernel_type='matrix')
+    post_mat, x_filt_mat, P_filt_mat = pff_mat._flow_update(observation=y_obs, particles=prior)
 
     print("Running Scalar Kernel PFF...")
-    pff_scal = KernelPFF(l96, N, kernel_type='scalar')
-    post_scal = pff_scal._flow_update(y_obs, prior, num_flow_steps, step_sizes=step_sizes)
+    # MODIFICATION: Pass flow hyperparams to constructor and unpack 3-tuple return
+    pff_scal = KernelPFF(l96, N, num_flow_steps=num_flow_steps, step_sizes=step_sizes, kernel_type='scalar')
+    post_scal, x_filt_scal, P_filt_scal = pff_scal._flow_update(observation=y_obs, particles=prior)
 
     # 4. Compute Analytical EnKF Covariance for contours
     idx_u = 18  # Unobserved x19

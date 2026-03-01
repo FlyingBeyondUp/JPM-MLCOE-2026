@@ -4,8 +4,8 @@ import tensorflow_probability as tfp
 from Filters.flow_filters import KernelPFF
 from models import NLSSM
 
-# Set standard precision as defined in your module
-dtype = tf.float64
+# MODIFICATION: Standardized precision to match the refactored framework
+dtype = tf.float32
 tfd = tfp.distributions
 
 
@@ -22,7 +22,7 @@ class TestKernelPFF(unittest.TestCase):
         self.num_particles = 15
         self.num_flow_steps = 3
 
-        # Initialize distributions using float64 to match KernelPFF requirements
+        # Initialize distributions using float32 to match KernelPFF requirements
         self.x0 = tf.zeros([self.state_dim], dtype=dtype)
         self.init_noise = tfd.MultivariateNormalDiag(
             loc=tf.zeros(self.state_dim, dtype=dtype),
@@ -72,6 +72,8 @@ class TestKernelPFF(unittest.TestCase):
 
         self.assertEqual(pff.alpha, 1.0 / self.num_particles)
         self.assertEqual(pff.C_loc_mat.shape, (self.state_dim, self.state_dim))
+
+        # MODIFICATION: Verify the dynamically fetched R_inv_diag property works
         self.assertEqual(pff.R_inv_diag.shape, (self.obs_dim,))
 
         # Ensure the covariance scaling factor is strictly positive
@@ -99,33 +101,45 @@ class TestKernelPFF(unittest.TestCase):
 
     def test_flow_update_matrix_kernel(self):
         """Tests the particle flow update using the matrix-valued kernel."""
-        pff = KernelPFF(model=self.model, num_particles=self.num_particles, kernel_type='matrix')
+        # MODIFICATION: Pass flow configuration into the constructor
+        pff = KernelPFF(model=self.model, num_particles=self.num_particles,
+                        num_flow_steps=self.num_flow_steps, step_sizes=self.step_sizes,
+                        kernel_type='matrix')
 
-        updated_particles = pff._flow_update(
-            observations=self.observations,
-            particles=self.particles,
-            num_flow_steps=self.num_flow_steps,
-            step_sizes=self.step_sizes
+        # MODIFICATION: Unpack the 3-tuple return and drop the redundant arguments
+        updated_particles, x_filt, P_filt = pff._flow_update(
+            observation=self.observations,
+            particles=self.particles
         )
 
         # Shape should remain invariant
         self.assertEqual(updated_particles.shape, self.particles.shape)
+
+        # Verify analytical statistics returned correctly
+        self.assertEqual(x_filt.shape, (self.batch_size, self.state_dim))
+        self.assertEqual(P_filt.shape, (self.batch_size, self.state_dim, self.state_dim))
+
         # Ensure particles actually moved
         self.assertFalse(tf.reduce_all(tf.math.equal(updated_particles, self.particles)))
         self.assertFalse(tf.reduce_any(tf.math.is_nan(updated_particles)))
 
     def test_flow_update_scalar_kernel(self):
         """Tests the particle flow update using the scalar-valued kernel."""
-        pff = KernelPFF(model=self.model, num_particles=self.num_particles, kernel_type='scalar')
+        # MODIFICATION: Pass flow configuration into the constructor
+        pff = KernelPFF(model=self.model, num_particles=self.num_particles,
+                        num_flow_steps=self.num_flow_steps, step_sizes=self.step_sizes,
+                        kernel_type='scalar')
 
-        updated_particles = pff._flow_update(
-            observations=self.observations,
-            particles=self.particles,
-            num_flow_steps=self.num_flow_steps,
-            step_sizes=self.step_sizes
+        # MODIFICATION: Unpack the 3-tuple return and drop the redundant arguments
+        updated_particles, x_filt, P_filt = pff._flow_update(
+            observation=self.observations,
+            particles=self.particles
         )
 
         self.assertEqual(updated_particles.shape, self.particles.shape)
+        self.assertEqual(x_filt.shape, (self.batch_size, self.state_dim))
+        self.assertEqual(P_filt.shape, (self.batch_size, self.state_dim, self.state_dim))
+
         self.assertFalse(tf.reduce_all(tf.math.equal(updated_particles, self.particles)))
         self.assertFalse(tf.reduce_any(tf.math.is_nan(updated_particles)))
 
