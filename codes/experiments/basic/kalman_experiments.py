@@ -1,11 +1,13 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib.pyplot as plt
-from models.base_models import LGSSM
-from Filters.basic_filters.kalman_filter import KalmanFilter, EM_initializer, EM_solver
 import math
 
+from models import LGSSM
+from Filters.basic_filters.kalman_filter import KalmanFilter, EM_initializer
+
 tfd = tfp.distributions
+
 
 def check_condition_number_impact(T=200, state_dim=10, obs_dim=10):
     # 1. Create a model with very low observation noise (High Precision)
@@ -17,31 +19,35 @@ def check_condition_number_impact(T=200, state_dim=10, obs_dim=10):
     R_small = tf.eye(obs_dim) * 1e-8
     model.set_params([model.A, model.C, model.Q, R_small, model.x0, model.P0])
 
-    names=['A', 'C', 'Q', 'R', 'x0', 'P0']
-    for name, param in zip(names, model.get_params()):
+    names = ['A', 'C', 'Q', 'R', 'x0', 'P0']
+    for name, param in zip(names, model.params):
         if name != 'x0':
             print(f"{name}:\n{tf.linalg.eigvals(param.numpy())}\n")
         else:
             print(f"{name}:\n{param.numpy()}\n")
 
-    kf = KalmanFilter(model)
-
-    # 2. Generate Data
-    X, Y = model.sample(T)
+    # 2. Generate Batched Data [1, T, D]
+    X, Y = model.sample(batch_size=1, T=T)
 
     # 3. Run Filter WITH Stabilization (Joseph Form)
-    X_stab, P_stab, _, _, _ = kf.filter(Y, T, requires_stabilization=True)
+    kf_stab = KalmanFilter(model, requires_stabilization=True)
+    res_stab = kf_stab.filter(Y)
+    X_stab, P_stab = res_stab['x_filt'], res_stab['P_filt']
 
     # 4. Run Filter WITHOUT Stabilization (Standard Form)
-    X_unstab, P_unstab, _, _, _ = kf.filter(Y, T, requires_stabilization=False)
+    kf_unstab = KalmanFilter(model, requires_stabilization=False)
+    res_unstab = kf_unstab.filter(Y)
+    X_unstab, P_unstab = res_unstab['x_filt'], res_unstab['P_filt']
+
+    # Squeeze batch dimensions for plotting/analysis
+    X, X_stab, X_unstab = X[0], X_stab[0], X_unstab[0]
+    P_stab, P_unstab = P_stab[0], P_unstab[0]
 
     # 5. Compute Condition Numbers
-    # Condition Number = max_eigenvalue / min_eigenvalue
     def get_condition_numbers(P_seq):
         conds = []
         for t in range(T):
             s = tf.linalg.svd(P_seq[t], compute_uv=False)
-            # s is sorted largest to smallest
             cond = s[0] / s[-1]
             conds.append(cond)
         return conds
@@ -59,7 +65,7 @@ def check_condition_number_impact(T=200, state_dim=10, obs_dim=10):
     plt.xlabel('Time Step')
     plt.legend()
     plt.grid(True, which="both", ls="-", alpha=0.3)
-    plt.savefig("Figures\KF_Condition_Number_t.pdf",bbox_inches='tight')
+    #plt.savefig("Figures/KF_Condition_Number_t.pdf", bbox_inches='tight')
     plt.show()
 
     # Check for asymmetry or non-PSD in unstabilized version
@@ -70,10 +76,9 @@ def check_condition_number_impact(T=200, state_dim=10, obs_dim=10):
 
     print(f"Final Unstabilized P Symmetric? {is_symmetric.numpy()}")
     print(f"Final Unstabilized P Min Eigenvalue: {min_eig.numpy()} (Should be > 0)")
-
     print(f"Max State Diff: {tf.reduce_max(tf.abs(X_stab - X_unstab)).numpy()}")
 
-    # check the inferred states
+    # Check the inferred states
     plt.figure(figsize=(10, 6))
     plt.plot(X[:, 0], X[:, 1], label='True State', linewidth=2)
     plt.plot(X_stab[:, 0], X_stab[:, 1], label='Inferred State (Stabilized)', linestyle='--', linewidth=2)
@@ -87,42 +92,44 @@ def check_condition_number_impact(T=200, state_dim=10, obs_dim=10):
 
 
 def show_EM_example(num_trials=64, T=100, state_dim=3, obs_dim=3, max_iters=50, stabilization=True):
-    '''
-    # compare the estimated parameters with the true parameters
-    Due to the identifiability issue of LGSSM, the estimated parameters may differ from
-    the true parameters by a linear transformation significantly even if the inference of latent variables is sound.
-
-    true_params=data_generator.get_params()
-    est_params=kf.model.get_params()
-    param_names=['A','C','Q','R','x0','P0']
-    for i in range(len(true_params)):
-        true_param=true_params[i]
-        est_param=est_params[i]
-        param_name=param_names[i]
-        param_error=tf.norm(true_param - est_param) / (tf.norm(true_param) + 1e-9)
-        print(f'Parameter {param_name} relative error: {param_error.numpy():.4f}')
-    '''
-
     data_generator = LGSSM(state_dim, obs_dim)
-    X, Y = data_generator.batch_sample(T=T, batch_size=num_trials)
+
+    A_true = tf.linalg.diag([0.95, 0.50, 0.8])
+
+    # Mix the states so they aren't perfectly aligned with the axes
+    rotation = tf.constant([[0.8, 0.6, 0.0],
+                            [-0.6, 0.8, 0.0],
+                            [0.0, 0.0, 1.0]], dtype=tf.float32)
+    A_true = tf.matmul(rotation, tf.matmul(A_true, rotation, transpose_b=True))
+
+    C_true = tf.eye(3, dtype=tf.float32)
+    Q_true = tf.eye(3, dtype=tf.float32) * 0.5  # Lower process noise
+    R_true = tf.eye(3, dtype=tf.float32) * 0.05  # Lower observation noise
+    x0_true = tf.zeros([3, 1], dtype=tf.float32)
+    P0_true = tf.eye(3, dtype=tf.float32)
+
+    data_generator = LGSSM(state_dim, obs_dim, params=[A_true, C_true, Q_true, R_true, x0_true, P0_true])
+    X, Y = data_generator.sample(batch_size=num_trials, T=T)
+
     kf = EM_initializer(Y, state_dim)
-    # kf=KalmanFilter(LGSSM(state_dim,obs_dim))
+    kf.requires_stabilization = stabilization
     print('Successfully initialized EM Kalman Filter')
 
-    list_log_l = EM_solver(kf, Y, max_iters, stabilization=stabilization)
+    # Run unified Fit API
+    list_log_l = kf.fit(Y, n_iter=max_iters)
 
     plt.figure()
     plt.plot(list_log_l)
     plt.xlabel('EM Iterations')
     plt.ylabel('Log Likelihood')
     plt.title('EM Convergence')
-    plt.savefig('KF_EM_Convergence.pdf')
+    #plt.savefig('Figures/KF_EM_Convergence.pdf', bbox_inches='tight')
     plt.show()
 
     print("\n=== Model Evaluation ===")
 
     # Observation Reconstruction
-    X_smooth, _, _, _ = kf.smooth_filter(Y)
+    X_smooth, _, _, _ = kf.smooth(Y)
     Y_pred = tf.matmul(X_smooth, kf.model.C, transpose_b=True)
 
     obs_rmse = tf.sqrt(tf.reduce_mean(tf.square(Y - Y_pred)))
@@ -153,36 +160,6 @@ def show_EM_example(num_trials=64, T=100, state_dim=3, obs_dim=3, max_iters=50, 
     print("Estimated Moduli:     ", tf.abs(eig_est_sorted).numpy())
 
 
-
-
-def test_filter(num_trials=128, T=50, state_dim=3, obs_dim=3):
-    model = LGSSM(state_dim, obs_dim)
-    kf = KalmanFilter(model)
-
-    X, Y = model.batch_sample(T=T, batch_size=num_trials)
-    X_filt, _, _, _, _ = kf.filter(Y)
-    X_smooth, _, _, _ = kf.smooth_filter(Y)
-
-    err_filt = X - X_filt
-    err_smooth = X - X_smooth
-
-    per_mse_filt = tf.reduce_mean(tf.square(err_filt), axis=[1, 2])
-    per_rmse_filt = tf.sqrt(per_mse_filt)
-
-    per_mse_smooth = tf.reduce_mean(tf.square(err_smooth), axis=[1, 2])
-    per_rmse_smooth = tf.sqrt(per_mse_smooth)
-
-    mean_rmse_filt = tf.reduce_mean(per_rmse_filt)
-    std_rmse_filt = tf.math.reduce_std(per_rmse_filt)
-
-    mean_rmse_smooth = tf.reduce_mean(per_rmse_smooth)
-    std_rmse_smooth = tf.math.reduce_std(per_rmse_smooth)
-
-    print(f'Filtering RMSE: {mean_rmse_filt.numpy():.4f} ± {std_rmse_filt.numpy():.4f}')
-    print(f'Smoothing RMSE: {mean_rmse_smooth.numpy():.4f} ± {std_rmse_smooth.numpy():.4f}')
-    eval_rmse_and_baselines(X, X_filt, X_smooth, Y, model)
-
-
 def eval_rmse_and_baselines(X, X_filt, X_smooth, Y, model):
     per_mse_filt = tf.reduce_mean(tf.square(X - X_filt), axis=[1, 2])
     per_rmse_filt = tf.sqrt(per_mse_filt)
@@ -198,8 +175,8 @@ def eval_rmse_and_baselines(X, X_filt, X_smooth, Y, model):
 
     baseline_zero_rmse = tf.sqrt(tf.reduce_mean(tf.square(X)))
 
-    pinvC = tf.linalg.pinv(model.C)  # shape [state_dim, obs_dim]
-    X_from_Y = tf.einsum('so,bto->bts', pinvC, Y)  # [B,T,state_dim]
+    pinvC = tf.linalg.pinv(model.C)
+    X_from_Y = tf.einsum('so,bto->bts', pinvC, Y)
     baseline_pinv_rmse = tf.sqrt(tf.reduce_mean(tf.square(X - X_from_Y)))
 
     print('\n')
@@ -211,23 +188,39 @@ def eval_rmse_and_baselines(X, X_filt, X_smooth, Y, model):
     print(f'Baseline pinv(C) RMSE: {baseline_pinv_rmse.numpy():.4f}')
 
 
-# eval_rmse_and_baselines(X, X_filt, X_smooth, Y, model)
+def test_filter(num_trials=128, T=50, state_dim=3, obs_dim=3):
+    model = LGSSM(state_dim, obs_dim)
+    kf = KalmanFilter(model)
+
+    X, Y = model.sample(batch_size=num_trials, T=T)
+    res = kf.filter(Y)
+    X_filt = res['x_filt']
+    X_smooth, _, _, _ = kf.smooth(Y)
+
+    eval_rmse_and_baselines(X, X_filt, X_smooth, Y, model)
 
 
 def show_example(T=100, state_dim=2, obs_dim=1):
     model = LGSSM(state_dim, obs_dim)
     kf = KalmanFilter(model)
 
-    x, y = model.sample(T=T)
-    x_filt, _ = kf.filter(y, T)[:2]
-    x_smooth, _, _, _ = kf.smooth_filter(y, T)
+    X, Y = model.sample(batch_size=1, T=T)
+    res = kf.filter(Y)
+    x_filt = res['x_filt']
+    x_smooth, _, _, _ = kf.smooth(Y)
+
+    # Squeeze batch dimension [1, T, D] -> [T, D]
+    x, y = X[0], Y[0]
+    x_filt, x_smooth = x_filt[0], x_smooth[0]
 
     time_axis = tf.range(T)
 
     plt.figure(figsize=(12, 8))
     for d in range(state_dim):
         plt.subplot(state_dim, 1, d + 1)
-        plt.plot(time_axis, y[:, d], label='Observations', color='gray', linestyle='None', marker='o', markersize=5,
+        # Use dimension slicing safely based on obs_dim constraint
+        plot_y = y[:, d] if d < obs_dim else tf.fill([T], float('nan'))
+        plt.plot(time_axis, plot_y, label='Observations', color='gray', linestyle='None', marker='o', markersize=5,
                  alpha=0.5)
         plt.plot(time_axis, x[:, d], label='True State', color='black')
         plt.plot(time_axis, x_filt[:, d], label='Filtered State', color='blue', linestyle='--')
@@ -243,19 +236,17 @@ def show_example(T=100, state_dim=2, obs_dim=1):
 def run_comparison_example():
     state_dim = 2  # [Position, Velocity]
     obs_dim = 1  # [Noisy Position]
-    dt = 0.1
 
     # Physics: Rotation matrix for harmonic oscillator
     theta = 0.1
     A_val = tf.constant([[math.cos(theta), math.sin(theta)],
                          [-math.sin(theta), math.cos(theta)]], dtype=tf.float32)
 
-    # Observation: We only see Position
     C_val = tf.constant([[1.0, 0.0]], dtype=tf.float32)
 
-    # Noise: Low process noise (smooth dynamics), HIGH observation noise
+    # Noise: Low process noise, HIGH observation noise
     Q_val = tf.eye(state_dim) * 0.01
-    R_val = tf.eye(obs_dim) * 1.0  # <--- High Noise!
+    R_val = tf.eye(obs_dim) * 1.0
 
     x0_val = tf.zeros([state_dim, 1])
     P0_val = tf.eye(state_dim)
@@ -267,16 +258,18 @@ def run_comparison_example():
 
     # --- 2. Generate Data ---
     T = 100
-    true_states, observations = my_model.sample(T)
+    true_states, observations = my_model.sample(batch_size=1, T=T)
 
     # --- 3. Run Custom Implementation ---
-    # Filter
-    custom_filt_x, _, _, _, _ = my_kf.filter(observations, T)
-    # custom_filt_x is already [T, state_dim] for non-batched input
+    res = my_kf.filter(observations)
+    custom_filt_x = res['x_filt'][0]
 
-    # Smooth
-    custom_smooth_x, _, _, _ = my_kf.smooth_filter(observations, T)
-    # custom_smooth_x is already [T, state_dim] for non-batched input
+    custom_smooth_x, _, _, _ = my_kf.smooth(observations)
+    custom_smooth_x = custom_smooth_x[0]
+
+    # Strip batch dimensions for TFP plotting
+    obs_tfp = observations[0]
+    true_states_tfp = true_states[0]
 
     # --- 4. Run TensorFlow Probability (TFP) Implementation ---
     tfp_lgssm = tfd.LinearGaussianStateSpaceModel(
@@ -288,21 +281,18 @@ def run_comparison_example():
         initial_state_prior=tfd.MultivariateNormalTriL(loc=tf.squeeze(x0_val), scale_tril=tf.linalg.cholesky(P0_val))
     )
 
-    # TFP Filter & Smooth
-    _, filtered_means, _, _, _, _, _ = tfp_lgssm.forward_filter(observations)
-    tfp_smoothed_means, _ = tfp_lgssm.posterior_marginals(observations)
+    _, filtered_means, _, _, _, _, _ = tfp_lgssm.forward_filter(obs_tfp)
+    tfp_smoothed_means, _ = tfp_lgssm.posterior_marginals(obs_tfp)
 
     # --- 5. Visualization ---
     plt.figure(figsize=(14, 10))
 
-    # Plot Position (Dim 0)
-    plt.plot(observations[:, 0], 'k.', alpha=0.3, label='Noisy Observations')
-    plt.plot(true_states[:, 0], 'k-', linewidth=2, label='True State')
+    plt.plot(obs_tfp[:, 0], 'k.', alpha=0.3, label='Noisy Observations')
+    plt.plot(true_states_tfp[:, 0], 'k-', linewidth=2, label='True State')
 
     plt.plot(custom_filt_x[:, 0], 'g-', label='Custom Filter')
     plt.plot(custom_smooth_x[:, 0], 'r-', linewidth=2, label='Custom Smoother')
 
-    # Overlay TFP to prove match
     plt.plot(filtered_means[:, 0], 'o:', linewidth=3, label='TFP Filter')
     plt.plot(tfp_smoothed_means[:, 0], 'y:', linewidth=3, label='TFP Smoother')
 
@@ -312,16 +302,17 @@ def run_comparison_example():
     plt.ylabel("State 0", fontsize=20)
     plt.grid(True, alpha=0.3)
 
-    # Calculate RMSE
-    rmse_filt = tf.sqrt(tf.reduce_mean((true_states - custom_filt_x) ** 2))
-    rmse_smooth = tf.sqrt(tf.reduce_mean((true_states - custom_smooth_x) ** 2))
+    rmse_filt = tf.sqrt(tf.reduce_mean((true_states_tfp - custom_filt_x) ** 2))
+    rmse_smooth = tf.sqrt(tf.reduce_mean((true_states_tfp - custom_smooth_x) ** 2))
 
     print(f"Filter RMSE:   {rmse_filt:.4f}")
     print(f"Smoother RMSE: {rmse_smooth:.4f}")
     print("If the yellow dotted line perfectly overlaps the red line, your custom implementation matches TFP.")
-    plt.savefig('Figures/kalman_filter_smoother_comparison.pdf', bbox_inches='tight')
+    #plt.savefig('Figures/kalman_filter_smoother_comparison.pdf', bbox_inches='tight')
     plt.show()
 
+
 if __name__ == "__main__":
-    check_condition_number_impact()
+    #check_condition_number_impact()
     show_EM_example()
+    #run_comparison_example()

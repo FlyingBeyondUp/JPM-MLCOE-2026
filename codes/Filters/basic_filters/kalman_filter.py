@@ -217,7 +217,7 @@ class KalmanFilter(BaseFilter):
             P_pred_next_chol = tf.linalg.cholesky(P_pred_next + 1e-6 * tf.eye(state_dim))
             rhs = tf.matmul(A, P_filt_t)
 
-            J_t_T = tf.linalg.cholesky_solve(P_pred_next_chol, tf.transpose(rhs, perm=[0, 2, 1]))
+            J_t_T = tf.linalg.cholesky_solve(P_pred_next_chol, rhs)
             J_t = tf.transpose(J_t_T, perm=[0, 2, 1])
 
             dx = x_smooth_next - x_pred_next

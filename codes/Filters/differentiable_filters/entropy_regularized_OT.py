@@ -27,7 +27,25 @@ class DifferentiableParticleFilter(ParticleFilter):
         self.sinkhorn_iter = sinkhorn_iter
         self.scaling = scaling
         self.optimizer = optimizer or tf.keras.optimizers.Adam(learning_rate=1e-4)
-        self.use_differentiable_resample = False
+
+        self._force_differentiable_eval = False
+        self.is_training = False
+
+    def train(self):
+        """
+        Activates training mode.
+        Enables differentiable Sinkhorn resampling for backpropagation.
+        """
+        self.is_training = True
+
+    def eval(self, force_differentiable=False):
+        """
+        Activates evaluation/inference mode.
+        Defaults to fast standard resampling for production tracking,
+        unless forced for research evaluation.
+        """
+        self.is_training = False
+        self._force_differentiable_eval = force_differentiable
 
     def _sinkhorn_potentials(self, a, b, C):
         """Computes dual potentials f, g using Log-domain Sinkhorn iterations."""
@@ -88,8 +106,8 @@ class DifferentiableParticleFilter(ParticleFilter):
     # API ALIGNMENT FIXES
     # ==========================================
     def _resample(self, particles: tf.Tensor, weights: tf.Tensor, ess: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """Intercepts resampling to route to OT when training."""
-        if self.use_differentiable_resample:
+        """Intercepts resampling to route to OT when training or forced."""
+        if self.is_training or self._force_differentiable_eval:
             return self._differentiable_resample(particles, weights)
         return super()._resample(particles, weights, ess)
 
@@ -165,34 +183,61 @@ class DifferentiableParticleFilter(ParticleFilter):
         return (resampled_particles, resampled_weights), (log_lik_inc, x_filt, P_filt, ess)
 
     @tf.function
-    def train_step(self, observations, requires_grad=False):
-        """Standardized training step executing the global AutoGraph filter loop."""
-        self.use_differentiable_resample = True
+    def train_step(self, observations, requires_grad=False, clip_norm=5.0):
+        """
+        Standardized training step executing the global AutoGraph filter loop
+        with professional gradient stabilization techniques.
+        """
+        self.is_training = True
+        # 1. Extract sequence length for time-normalization
+        T = tf.cast(tf.shape(observations)[1], dtype)
         with tf.GradientTape() as tape:
             # The base_filter will now execute seamlessly inside the tape
             res = super().filter(observations)
             log_likelihood_batch = res['log_likelihood']
+            # 2. Time-Normalized Loss
+            # Because log_likelihood is summed over time,
+            # we divide by T to prevent the loss and gradients from scaling
+            # linearly with the sequence length.
+            loss = -tf.reduce_mean(log_likelihood_batch) / T
 
-            # Maximize Likelihood => Minimize Negative Likelihood
-            loss = -tf.reduce_mean(log_likelihood_batch)
+        # Compute raw gradients
+        trainable_vars = self.model.trainable_variables
+        gradients = tape.gradient(loss, trainable_vars)
+        # Safely filter out variables that have no gradient (None)
+        valid_grads_and_vars = [
+            (g, v) for g, v in zip(gradients, trainable_vars) if g is not None
+        ]
+        valid_grads = [g for g, v in valid_grads_and_vars]
+        valid_vars = [v for g, v in valid_grads_and_vars]
+        # 3. Defensive Programming: NaN/Inf Masking
+        # Sinkhorn potentials can occasionally produce numerical instability.
+        # We replace any NaN/Inf gradients with zeros so they don't corrupt the optimizer state.
+        safe_grads = [
+            tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
+            for g in valid_grads
+        ]
+        # 4. Global Gradient Clipping
+        # We clip the entire gradient vector to a maximum norm (e.g., 5.0) to prevent
+        # massive updates while strictly preserving the direction of the gradient vector.
+        clipped_grads, global_norm = tf.clip_by_global_norm(safe_grads, clip_norm)
 
-        gradients = tape.gradient(loss, self.model.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        # Apply the stabilized gradients
+        self.optimizer.apply_gradients(zip(clipped_grads, valid_vars))
 
         if requires_grad:
-            return loss, gradients
+            return loss, clipped_grads
         return loss
 
-    def fit(self, dataset: tf.data.Dataset, epochs: int = 10):
+    def fit(self, dataset: tf.data.Dataset, epochs: int = 10,clip_norm=5.0):
         for epoch in range(epochs):
             total_loss = 0.0
             steps = 0
             for batch in dataset:
-                loss = self.train_step(batch)
+                loss = self.train_step(batch,clip_norm=clip_norm)
                 total_loss += float(loss)
                 steps += 1
             print(f"Epoch {epoch + 1}: Loss = {total_loss / max(steps, 1):.4f}")
 
     def filter(self, observations):
-        self.use_differentiable_resample = False
         return super().filter(observations)

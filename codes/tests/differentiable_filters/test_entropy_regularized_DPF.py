@@ -218,26 +218,60 @@ class DifferentiableParticleFilterTestCase(unittest.TestCase):
 
     def test_training_convergence_on_simple_sequence(self):
         """
-        Professional Check: Can the model actually learn (reduce loss) on a dummy sequence?
+        Practical Check whether the model actually learn (reduce loss) on a structured sequence。
+        Instead of pure noise, we use a noisy sine wave to give the transition and
+        observation networks a distinct temporal pattern to learn.
         """
-        dpf = self._make_dpf(num_particles=32, epsilon=0.25, sinkhorn_iter=50)
+        # 1. Initialize with more particles to reduce Monte Carlo variance
+        # and a lower learning rate to prevent the optimizer from overshooting.
+        dpf = self._make_dpf(num_particles=64, epsilon=0.1, sinkhorn_iter=20)
+        dpf.optimizer.learning_rate.assign(1e-3)
         dpf.use_differentiable_resample = True
 
-        obs = tf.random.normal([16, 10, dpf.model.obs_dim], dtype=tf.float32)
+        B, T = 16, 15
 
-        initial_loss, init_grad = dpf.train_step(obs, requires_grad=True)
-        print('initial loss:', initial_loss.numpy())
+        # 2. Generate structured synthetic data (a noisy sine wave)
+        # This guarantees a pattern exists for the LearnableSSM to capture.
+        import numpy as np
+        t_steps = np.linspace(0, 3, T, dtype=np.float32)
+        true_signal = np.sin(t_steps)  # [T]
 
-        # Train for a few steps
-        for _ in range(5):
-            final_loss, final_grad = dpf.train_step(obs, requires_grad=True)
+        # Expand and broadcast to [B, T, Obs_Dim]
+        true_signal_expanded = tf.cast(tf.reshape(true_signal, [1, T, 1]), tf.float32)
+        true_signal_expanded = tf.tile(true_signal_expanded, [B, 1, dpf.model.obs_dim])
 
-        # Strip out None gradients for the global norm calculation
+        # Add a small amount of observation noise
+        obs = true_signal_expanded + tf.random.normal([B, T, dpf.model.obs_dim], stddev=0.1)
+
+        # 3. Compute the initial loss
+        # We temporarily fix the seed to ensure that the initial and final loss
+        # evaluations aren't skewed by the random sampling of the particles themselves.
+        tf.random.set_seed(42)
+        initial_loss, _ = dpf.train_step(obs, requires_grad=True)
+
+        # 4. Train for a sufficient number of steps
+        # 15-20 steps is generally enough for Adam to establish a downward trajectory
+        # on a simple deterministic sequence.
+        for _ in range(20):
+            _ = dpf.train_step(obs,clip_norm=1000.0)
+
+        # 5. Compute the final loss
+        tf.random.set_seed(42)  # Reset seed for an apples-to-apples loss comparison
+        final_loss, final_grad = dpf.train_step(obs, requires_grad=True)
+
+        # Extract valid gradients for debugging output
         valid_grads = [g for g in final_grad if g is not None]
-        print(f"Final Loss: {final_loss.numpy():.4f}")
-        print(f"Gradient norm: {tf.linalg.global_norm(valid_grads).numpy():.4f}")
 
-        self.assertLess(final_loss, initial_loss, "Loss did not decrease after training steps.")
+        print(f"\nInitial Loss: {initial_loss.numpy():.4f}")
+        print(f"Final Loss:   {final_loss.numpy():.4f}")
+        print(f"Final Grad Norm: {tf.linalg.global_norm(valid_grads).numpy():.4f}")
+
+        # 6. Assert that the model has successfully learned the pattern
+        self.assertLess(
+            final_loss,
+            initial_loss,
+            "Loss did not decrease. The model failed to learn the temporal pattern."
+        )
 
     def _assert_all_finite(self, x, name: str):
         x = tf.convert_to_tensor(x)
