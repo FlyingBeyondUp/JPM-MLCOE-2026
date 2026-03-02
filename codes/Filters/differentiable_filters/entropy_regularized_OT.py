@@ -16,7 +16,7 @@ class DifferentiableParticleFilter(ParticleFilter):
                  resample_method: str = 'multinomial'):
         """
         Args:
-            model: Instance of modified NLSSM.
+            model: Instance of, Learnable State Space Model, which is effectively modified NLSSM.
             epsilon: Entropy regularization weight (from paper).
             sinkhorn_iter: Steps for Sinkhorn loop.
             scaling: Optional scaling for cost matrix stability.
