@@ -191,4 +191,4 @@ def run_experiment_Vasicek_EM(kappa, theta, sigma, tau, dt, T=50, batch_size=20,
 if __name__ == '__main__':
     #run_example_SVM(alpha=0.9, sigma=0.3, beta=0.5)
     #run_experiment_Vasicek(kappa=0.1, theta=0.05, sigma=0.02, tau=20.0, dt=1/252, x0=tf.constant([0.05]))
-    run_experiment_Vasicek_EM(kappa=0.1, theta=0.05, sigma=0.05, tau=15.0, dt=1/252, T=100, batch_size=50, n_em_iter=10)
+    run_experiment_Vasicek_EM(kappa=0.2, theta=0.05, sigma=0.02, tau=15.0, dt=1/252, T=100, batch_size=50, n_em_iter=10)

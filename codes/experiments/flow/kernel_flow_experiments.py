@@ -10,6 +10,15 @@ dtype = tf.float32
 tf.random.set_seed(42)
 np.random.seed(42)
 
+def build_lorenz96_localization(state_dim, r_loc=4.0):
+    """Builds a Schur product matrix for a 1D periodic ring."""
+    idx = tf.range(state_dim)
+    diff_idx = tf.abs(tf.expand_dims(idx, 0) - tf.expand_dims(idx, 1))
+    # Periodic boundary wrap-around distance
+    dist_mat = tf.minimum(diff_idx, state_dim - diff_idx)
+    C_loc_mat = tf.exp(-(tf.cast(dist_mat, tf.float32) / r_loc) ** 2)
+    return C_loc_mat
+
 
 def replicate_figure_3():
     N = 20
@@ -18,6 +27,8 @@ def replicate_figure_3():
 
     print(f"Initializing Lorenz 96 (D={D})...")
     l96 = getLorenz96Model(state_dim=D, obs_dim=250, F=F, observation_noise_std=0.5, observe_every_nth=4)
+    # Inject the specific spatial topology into the filter
+    lorenz_loc = build_lorenz96_localization(state_dim=1000)
 
     # 1. Spin up Truth
     x_true = tf.ones((1, D), dtype=dtype) * F
@@ -57,12 +68,12 @@ def replicate_figure_3():
     step_sizes = tf.ones(num_flow_steps, dtype=dtype) * 0.05
 
     # MODIFICATION: Pass flow hyperparams to constructor and unpack 3-tuple return
-    pff_mat = KernelPFF(l96, N, num_flow_steps=num_flow_steps, step_sizes=step_sizes, kernel_type='matrix')
+    pff_mat = KernelPFF(l96, N, num_flow_steps=num_flow_steps, step_sizes=step_sizes, kernel_type='matrix', C_loc_mat=lorenz_loc)
     post_mat, x_filt_mat, P_filt_mat = pff_mat._flow_update(observation=y_obs, particles=prior)
 
     print("Running Scalar Kernel PFF...")
     # MODIFICATION: Pass flow hyperparams to constructor and unpack 3-tuple return
-    pff_scal = KernelPFF(l96, N, num_flow_steps=num_flow_steps, step_sizes=step_sizes, kernel_type='scalar')
+    pff_scal = KernelPFF(l96, N, num_flow_steps=num_flow_steps, step_sizes=step_sizes, kernel_type='scalar', C_loc_mat=lorenz_loc)
     post_scal, x_filt_scal, P_filt_scal = pff_scal._flow_update(observation=y_obs, particles=prior)
 
     # 4. Compute Analytical EnKF Covariance for contours
@@ -124,7 +135,7 @@ def replicate_figure_3():
     plot_res(axes[0], post_mat, "matrix-valued")
     plot_res(axes[1], post_scal, "scalar")
 
-    plt.savefig("posterior_kernelPFF.pdf", bbox_inches='tight')
+    #plt.savefig("posterior_kernelPFF.pdf", bbox_inches='tight')
     plt.show()
 
 

@@ -15,22 +15,27 @@ class KernelPFF(EDHFlow):
     """
 
     def __init__(self, model, num_particles, num_flow_steps=10, step_sizes=None,
-                 ukf=None, resample_from_ukf=False, kernel_type='matrix'):
+                 ukf=None, resample_from_ukf=False, kernel_type='matrix',C_loc_mat=None):
         # 1. API FIX: Pipe the standard flow arguments down to the EDHFlow parent
         super().__init__(model, num_particles, num_flow_steps, step_sizes, ukf, resample_from_ukf)
 
         self.kernel_type = kernel_type
         self.alpha = 1.0 / num_particles
 
-        r_loc = 4.0
-        idx = tf.range(model.state_dim)
-        diff_idx = tf.abs(tf.expand_dims(idx, 0) - tf.expand_dims(idx, 1))
-        dist_mat = tf.minimum(diff_idx, model.state_dim - diff_idx)
-        self.C_loc_mat = tf.exp(-(tf.cast(dist_mat, dtype) / r_loc) ** 2)  # [D, D]
+        if C_loc_mat is not None:
+            self.C_loc_mat = tf.cast(C_loc_mat, dtype)
+            tf.debugging.assert_shapes([
+                (self.C_loc_mat, (model.state_dim, model.state_dim))
+            ], message="C_loc_mat must be shape [state_dim, state_dim]")
+        else:
+            # Default to an unlocalized system (dense matrix of 1.0s).
+            # This mathematically nullifies the Schur product later in the code:
+            # B_loc = B_sample * self.C_loc_mat
+            self.C_loc_mat = tf.ones([model.state_dim, model.state_dim], dtype=dtype)
 
     @property
     def R_inv_diag(self):
-        """API FIX: Dynamically fetch observation noise precision from the model."""
+        """Dynamically fetch observation noise precision from the model."""
         R = self._get_cov(self.model.observation_noise)
         R_diag = tf.linalg.diag_part(R)
         return 1.0 / (R_diag + 1e-6)

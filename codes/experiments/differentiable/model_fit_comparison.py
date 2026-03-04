@@ -91,12 +91,12 @@ def create_learnable_model(init_guess, state_dim=1, obs_dim=1):
 # ==========================================
 def run_statistical_comparison():
     batch_size = 8
-    num_particles = 15  # Starved particle count to expose variance
+    num_particles = 16  # Starved particle count to expose variance
     T = 60
     true_theta = 0.85
     init_guess = 0.20
     num_runs = 10
-    epochs = 25
+    epochs = 200
 
     print(f"\n--- EXPERIMENT A: Statistical Comparison ({num_runs} Runs) ---")
     print(f"Target Theta: {true_theta} | Initial Guess: {init_guess} | Particles: {num_particles}")
@@ -108,6 +108,7 @@ def run_statistical_comparison():
 
     for run in range(num_runs):
         tf.random.set_seed(run)  # Isolate noise realizations
+        batch_y = setup_experiment_data(T=T, batch_size=batch_size, true_theta=true_theta)
 
         # 1. Setup Models
         model_soft, trans_soft = create_learnable_model(init_guess)
@@ -115,24 +116,24 @@ def run_statistical_comparison():
 
         srf = SoftResamplingParticleFilter(
             model=model_soft, num_particles=num_particles, alpha=0.5,
-            optimizer=tf.keras.optimizers.Adam(learning_rate=0.03)
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.005)
         )
         dpf = DifferentiableParticleFilter(
             model=model_dpf, num_particles=num_particles, epsilon=0.5, sinkhorn_iter=20,
-            optimizer=tf.keras.optimizers.Adam(learning_rate=0.03)
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.005)
         )
 
         # 2. Train Soft Resampling
         start_time = time.perf_counter()
         for _ in range(epochs):
-            srf.train_step(batch_y, clip_norm=2.0)  #
+            srf.train_step(batch_y, clip_norm=10.0)  #
         soft_times.append(time.perf_counter() - start_time)
         soft_thetas.append(trans_soft.theta.numpy())
 
         # 3. Train DPF
         start_time = time.perf_counter()
         for _ in range(epochs):
-            dpf.train_step(batch_y, clip_norm=2.0)  #
+            dpf.train_step(batch_y, clip_norm=10.0)  #
         dpf_times.append(time.perf_counter() - start_time)
         dpf_thetas.append(trans_dpf.theta.numpy())
 
@@ -154,7 +155,7 @@ def run_statistical_comparison():
 def run_hyperparameter_sweep():
     print("\n--- EXPERIMENT B: Hyperparameter Bias-Variance Sweep ---")
 
-    batch_y = setup_experiment_data(batch_size=8, T=40, true_theta=0.85)
+    #batch_y = setup_experiment_data(batch_size=8, T=40, true_theta=0.85)
 
     # 1. Sweep Alpha for Soft Resampling
     alphas = [0.1, 0.3, 0.5, 0.7, 0.9]
@@ -163,14 +164,18 @@ def run_hyperparameter_sweep():
     print("Sweeping Alpha (Soft Resampling)...")
     for alpha in alphas:
         thetas = []
-        for trial in range(5):
+        for trial in range(10):
             tf.random.set_seed(trial * 100)
 
+
             model, trans = create_learnable_model(0.20)
-            srf = SoftResamplingParticleFilter(model, num_particles=20, alpha=alpha,
-                                               optimizer=tf.keras.optimizers.Adam(learning_rate=0.04))
-            for _ in range(25):
-                srf.train_step(batch_y, clip_norm=2.0)
+            srf = SoftResamplingParticleFilter(model, num_particles=16, alpha=alpha,
+                                               optimizer=tf.keras.optimizers.Adam(learning_rate=0.005))
+            for i in range(201):
+                batch_y = setup_experiment_data(batch_size=8, T=60, true_theta=0.85)
+                loss=srf.train_step(batch_y, clip_norm=10.0)
+                if i%10==0:
+                    print(f'Alpha {alpha:.1f} | Trial {trial + 1}/10 | Loss: {loss:.4f}')
             thetas.append(trans.theta.numpy())
 
         # VERY IMPORTANT: These must be indented under the `for alpha in alphas:` loop!
@@ -178,20 +183,24 @@ def run_hyperparameter_sweep():
         soft_variances.append(np.var(thetas))
 
     # 2. Sweep Epsilon for DPF
-    epsilons = [0.1, 0.5, 1.0, 2.5, 5.0]
+    epsilons = [0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
     dpf_biases, dpf_variances = [], []
 
     print("Sweeping Epsilon (Sinkhorn DPF)...")
     for eps in epsilons:
         thetas = []
-        for trial in range(5):
-            tf.random.set_seed(trial * 100 + 42)
+        for trial in range(10):
+            tf.random.set_seed(trial * 100)
 
+            #batch_y = setup_experiment_data(batch_size=8, T=60, true_theta=0.85)
             model, trans = create_learnable_model(0.20)
-            dpf = DifferentiableParticleFilter(model, num_particles=20, epsilon=eps, sinkhorn_iter=20,
-                                               optimizer=tf.keras.optimizers.Adam(learning_rate=0.04))
-            for _ in range(100):
-                dpf.train_step(batch_y, clip_norm=2.0)
+            dpf = DifferentiableParticleFilter(model, num_particles=16, epsilon=eps, sinkhorn_iter=20,
+                                               optimizer=tf.keras.optimizers.Adam(learning_rate=0.005))
+            for i in range(201):
+                batch_y = setup_experiment_data(batch_size=8, T=60, true_theta=0.85)
+                loss=dpf.train_step(batch_y, clip_norm=10.0)
+                if i%20==0:
+                    print(f'Epsilon {eps:.2f} | Trial {trial + 1}/10 | Loss: {loss:.4f}')
             thetas.append(trans.theta.numpy())
 
         # VERY IMPORTANT: These must be indented under the `for eps in epsilons:` loop!
@@ -226,7 +235,7 @@ def run_hyperparameter_sweep():
     ax2_var.tick_params(axis='y', labelcolor='r')
 
     plt.tight_layout()
-    plt.savefig('bias_variance_comparison.pdf',bbox_inches='tight')
+    #plt.savefig('bias_variance_comparison.pdf',bbox_inches='tight')
     print("\nPlot saved successfully to 'bias_variance_comparison.png'!")
     plt.show()
 

@@ -21,19 +21,19 @@ class ExtendedKalmanFilter(BaseFilter):
         super().__init__(model)
         self.requires_stabilization = requires_stabilization
 
-    def _batch_linearize(self, fn, x):
+    def _batch_linearize(self, fn, x,noise_dim:int=None):
         """
         Batch linearization.
         Only computes the Jacobian with respect to the state (A or C).
         """
-        # Pass zero noise to isolate the deterministic function
-        zero_noise = tf.zeros_like(x) if fn.__name__ == 'transition_fn' else tf.zeros(
-            [tf.shape(x)[0], self.model.obs_dim])
+        if noise_dim is None:
+            noise_dim = x.shape[-1]  # 默认与状态维度相同（用于 transition_fn）
 
+        batch_size = tf.shape(x)[0]
+        zero_noise = tf.zeros([batch_size, noise_dim], dtype=x.dtype)
         with tf.GradientTape() as tape:
             tape.watch(x)
             val = fn(x, zero_noise)
-
         J_x = tape.batch_jacobian(val, x)
         return val, J_x
 
@@ -65,7 +65,9 @@ class ExtendedKalmanFilter(BaseFilter):
         Q = tf.expand_dims(self._get_cov(self.model.process_noise), 0)
 
         # 1. Linearize just the state
-        x_pred, A = self._batch_linearize(self.model.transition_fn, x_filt_prev)
+        x_pred, A = self._batch_linearize(
+            self.model.transition_fn, x_filt_prev, noise_dim=self.model.state_dim
+        )
 
         # 2. Additive noise update (No W matrix needed!)
         P_pred = tf.matmul(A, tf.matmul(P_filt_prev, A, transpose_b=True)) + Q
@@ -82,7 +84,7 @@ class ExtendedKalmanFilter(BaseFilter):
         R = tf.expand_dims(self._get_cov(self.model.observation_noise), 0)
 
         # 1. Linearize just the state
-        h_val, C = self._batch_linearize(self.model.observation_fn, x_pred)
+        h_val, C = self._batch_linearize(self.model.observation_fn, x_pred, noise_dim=obs_dim)
 
         innov = tf.expand_dims(observation - h_val, -1)
 

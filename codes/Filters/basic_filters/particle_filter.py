@@ -92,11 +92,14 @@ class ParticleFilter(BaseFilter):
             log_prob = dist.log_prob(target)
         else:
             # Additive noise fallback
-            zero_noise = tf.zeros_like(target)
-            pred = map_fn(source, zero_noise)
-            residual = target - pred
-            log_prob = noise_dist.log_prob(residual)
+            # target: [B, 1, Obs_Dim], source: [B, N, State_Dim]
+            # noise must match particle axis: [B, N, Obs_Dim]
+            obs_dim = tf.shape(target)[-1]
+            zero_noise = tf.zeros([B, N, obs_dim], dtype=source.dtype)
 
+            pred = map_fn(source, zero_noise)  # [B, N, Obs_Dim]
+            residual = target - pred  # broadcast [B,1,Obs_Dim] -> [B,N,Obs_Dim]
+            log_prob = noise_dist.log_prob(residual)  # [B, N] or [B, N, ...] depending on dist
         return tf.reshape(log_prob, [B, N])
 
     def update(self, t: int, state: tuple, observation: tf.Tensor) -> tuple:
